@@ -80,6 +80,7 @@ import argparse
 import bisect
 import csv
 import html
+import io
 import json
 import os
 import random
@@ -87,6 +88,7 @@ import re
 import secrets
 import sys
 import time
+import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1644,6 +1646,9 @@ QUARANTINE = "Duplicates"
 
 # Preview limits and conversions for the live UI's file viewer.
 MAX_PREVIEW_BYTES = 25 * 1024 * 1024
+MAX_ZIP_BYTES = 100 * 1024 * 1024      # listing only reads the directory
+MAX_ZIP_ENTRIES = 2000
+MAX_SHARE_DETAIL = 1500                # per-item permission lookups
 EXPORT_AS = {
     "application/vnd.google-apps.document": "application/pdf",
     "application/vnd.google-apps.presentation": "application/pdf",
@@ -2566,6 +2571,7 @@ box-shadow:0 12px 34px rgba(0,0,0,.26);padding:9px;display:none}
 background:transparent;color:var(--ink);font:inherit;font-size:13px;
 padding:6px 8px;border-radius:6px;cursor:pointer;overflow-wrap:anywhere}
 .pickitem:hover,.pickitem.act{background:var(--grid)}
+.hint{color:var(--muted);font-size:11.5px}
 .pickitem .hint{color:var(--muted);font-size:11.5px}
 .pickitem:disabled{opacity:.5;cursor:not-allowed;background:transparent}
 .picksec{font-size:11px;text-transform:uppercase;letter-spacing:.05em;
@@ -2610,6 +2616,19 @@ font-size:16px}
 border-radius:8px;padding:3px 7px;background:var(--plane);font-size:13px}
 .cat input{border:0;background:transparent;width:110px;font-weight:600;
 padding:1px 2px;font-size:13px}
+.cat.inuse{border-color:var(--s1);background:rgba(42,120,214,.12);
+color:var(--s1)}
+.cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
+padding:0 6px;font-size:11px;font-weight:700}
+.cat.inuse .x{color:var(--s1)}
+.cat.inuse .x:hover{color:var(--crit)}
+.cat.person{cursor:pointer;font:inherit;font-size:13px;color:var(--ink);
+gap:7px}
+.cat.person:hover{border-color:var(--s1);background:var(--grid)}
+.cat.person .cnt{background:var(--grid);border-radius:9px;padding:0 6px;
+font-size:11px;font-weight:700;color:var(--ink2)}
+.cat.person.public{border-color:var(--crit)}
+.cat.person.public .cnt{background:var(--crit);color:#fff}
 .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
 align-items:center;justify-content:center;z-index:50}
 .ov.on{display:flex}
@@ -2663,6 +2682,7 @@ tab — removes a sharing permission. Every change is logged and reversible.
       <button class="btn ghost" onclick="refreshActive(this)">Refresh</button>
     </div>
     <div id=sharehead class=note style="display:none;margin:0 0 12px"></div>
+    <div id=people style="display:none"></div>
     <div id=tree class=tree></div>
     <div id=stree class=tree style="display:none"></div>
     <div id=ttree class=tree style="display:none"></div>
@@ -2694,6 +2714,8 @@ tab — removes a sharing permission. Every change is logged and reversible.
       <strong style="flex:1">Revisions</strong>
       <span class=muted style="font-size:12px">newest first</span>
     </div>
+    <div id=runsum class=muted style="font-size:12.5px;margin:2px 0 4px">
+      </div>
     <div id=runs class=pend></div>
     <div class=muted style="font-size:12px;margin-top:4px">Every run keeps its
       undo log. Undoing is safe to repeat — items already back in place are
@@ -2882,24 +2904,60 @@ function chipList(){
   });
   return out.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
 }
+// How many planned moves target this destination (or anything under it).
+function planCount(c){
+  return Object.values(PLAN).filter(
+    p=>p.target===c || p.target.indexOf(c+'/')===0).length;
+}
 function drawCats(){
   const chips = chipList();
+  // Destinations in use that are not root folders or your own additions —
+  // nested folders you picked from the search. They belong on the list too,
+  // otherwise there is nowhere to see or clear that selection.
+  const extra = [];
+  Object.values(PLAN).forEach(p=>{
+    const t = p.target;
+    if(t && chips.indexOf(t)===-1 && extra.indexOf(t)===-1) extra.push(t);
+  });
+  const all = chips.concat(extra.sort((a,b)=>
+    a.toLowerCase().localeCompare(b.toLowerCase())));
   const nested = CATS.length - chips.length;
-  document.getElementById('cats').innerHTML = chips.map(c=>{
+  document.getElementById('cats').innerHTML = all.map(c=>{
     const isNew = ROOT_FOLDERS.indexOf(c)===-1;
-    const inner = isNew
-      ? '<input value="'+esc(c)+'" onchange="renameCat(\''+esc(c)+
-        '\',this.value)">'+
-        '<button class=x style="border:0;background:transparent;'+
-        'color:var(--muted);cursor:pointer" onclick="delCat(\''+esc(c)+
-        '\')">&times;</button>'
-      : '<span style="font-weight:600">'+esc(c)+'</span>'+
-        '<span class=muted style="font-size:10.5px">existing</span>';
-    return '<div class=cat>'+inner+'</div>';
+    const n = planCount(c);
+    // In use: highlighted, counted, and clearable with one click.
+    const inner = n
+      ? '<span style="font-weight:650">'+esc(c)+'</span>'+
+        '<span class=cnt>'+n+'</span>'+
+        '<button class=x title="clear '+n+' selection'+(n===1?'':'s')+
+        ' for this destination" onclick="clearDest(\''+
+        esc(c).replace(/'/g,"\\'")+'\')">&times;</button>'
+      : (isNew
+        ? '<input value="'+esc(c)+'" onchange="renameCat(\''+esc(c)+
+          '\',this.value)">'+
+          '<button class=x style="border:0;background:transparent;'+
+          'color:var(--muted);cursor:pointer" onclick="delCat(\''+esc(c)+
+          '\')">&times;</button>'
+        : '<span style="font-weight:600">'+esc(c)+'</span>'+
+          '<span class=muted style="font-size:10.5px">existing</span>');
+    return '<div class="cat'+(n?' inuse':'')+'">'+inner+'</div>';
   }).join('') + (nested>0
     ? '<div class=muted style="font-size:11.5px;width:100%;margin-top:4px">'+
       '+ '+nested+' nested folder'+(nested===1?'':'s')+' you have browsed '+
       'to, selectable in the row dropdowns</div>' : '');
+}
+// Undo every selection pointing at a destination, from the chip.
+async function clearDest(c){
+  const hits = Object.keys(PLAN).filter(
+    k=>PLAN[k].target===c || PLAN[k].target.indexOf(c+'/')===0);
+  if(!hits.length) return;
+  if(!await uiConfirm('Clear '+hits.length+' selection'+
+      (hits.length===1?'':'s')+' pointing at <b>'+esc(c)+'</b>?'+
+      '<br><span class=muted>Those items go back to staying where they '+
+      'are. Nothing in your Drive changes.</span>',
+      {title:'Clear selections', yes:'Clear'})) return;
+  hits.forEach(k=>delete PLAN[k]);
+  drawPlan(); refreshTags(); redrawSelects();
 }
 function addCat(){
   const el=document.getElementById('newcat');
@@ -3037,6 +3095,9 @@ function fileKind(n){
       m.slice(28))>-1 ? 'pdf' : 'none';
   if(m.indexOf('video/')===0) return 'video';
   if(m.indexOf('audio/')===0) return 'audio';
+  if(m==='application/zip' || m==='application/x-zip-compressed' ||
+     ['zip','jar','war','apk','xpi','epub','docx','xlsx','pptx'
+     ].indexOf(ext)>-1) return 'zip';
   if(m.indexOf('text/')===0 || m==='application/json' ||
      m==='application/xml' || TEXT_MIME.indexOf(m)>-1 ||
      ['txt','md','log','csv','json','xml','yml','yaml','ini','env','toml',
@@ -3354,10 +3415,14 @@ function drawPicker(){
       (FSTATUS.building?'<span class=spin></span> ':'')+esc(r.label)+'</div>';
     if(!r.disabled) n++;
     const act = (!r.disabled && PICK && n===PICK.active) ? ' act' : '';
+    // A folder icon for real destinations, a sparkle for one that will be
+    // created, and the "stay put" row keeps its own marker.
+    const ic = r.value === ''
+      ? '\u{21A9}️ ' : (r.isNew ? '\u{2728} ' : '\u{1F4C1} ');
     return '<button class="pickitem'+act+'"'+(r.disabled?' disabled':'')+
       ' title="'+esc(r.value||r.label)+'"'+
       (r.disabled?'':' onclick="choosePick('+(r.isNew?'1':'0')+','+n+')"')+
-      '>'+(r.checked?'&#10003; ':'')+esc(r.label)+
+      '>'+(r.checked?'&#10003; ':'')+ic+esc(r.label)+
       (r.sub?' <span class=hint>in '+esc(r.sub)+'</span>':'')+
       (r.hint?' <span class=hint>— '+esc(r.hint)+'</span>':'')+'</button>';
   }).join('');
@@ -3511,7 +3576,7 @@ function drawPlan(){
         '\')">&times;</button></div>').join('')
     : '<div class=muted style="font-size:13px;padding:6px 0">Nothing planned '+
       'yet. Everything stays exactly where it is.</div>';
-  savePlan(); paintRows();
+  savePlan(); paintRows(); drawCats();
 }
 function unplan(k){ delete PLAN[k]; drawPlan(); refreshTags(); redrawSelects(); }
 
@@ -3616,6 +3681,9 @@ function viewFile(id){
   } else if(kind==='text'){
     body = '<pre class=vtext id=vtext><span class=spin></span> '+
       'loading&hellip;</pre>';
+  } else if(kind==='zip'){
+    body = '<div id=vzip class=vtext style="font:inherit">'+
+      '<span class=spin></span> reading the archive&hellip;</div>';
   } else {
     body = '<p class=muted>No inline preview for this file type — '+
       'open it in Drive or download it.</p>';
@@ -3623,6 +3691,43 @@ function viewFile(id){
   box.innerHTML = head + body + actions;
   document.getElementById('ov').classList.add('on');
   if(kind==='text') loadText(url);
+  if(kind==='zip') loadZip(it.id);
+}
+// Archive contents, read from the zip's own directory — nothing is
+// extracted and nothing is written to disk.
+async function loadZip(id){
+  const host = document.getElementById('vzip');
+  if(!host) return;
+  let d;
+  try{ d = await api('/api/zip?id='+encodeURIComponent(id)); }
+  catch(e){
+    host.innerHTML = '<span class=muted>Could not read the archive: '+
+      esc(niceErr(e))+'</span>';
+    return;
+  }
+  if(!d.entries.length){
+    host.innerHTML = '<span class=muted>The archive is empty.</span>';
+    return;
+  }
+  const files = d.entries.filter(e=>!e.dir);
+  host.innerHTML =
+    '<div class=muted style="font:13px/1.5 system-ui;margin-bottom:9px">'+
+    files.length.toLocaleString()+' file'+(files.length===1?'':'s')+
+    (d.entries.length-files.length
+      ? ', '+(d.entries.length-files.length).toLocaleString()+' folder'+
+        (d.entries.length-files.length===1?'':'s') : '')+
+    ' &middot; '+human(d.bytes)+' uncompressed'+
+    (d.truncated?' &middot; showing the first '+
+      d.entries.length.toLocaleString()+' of '+d.total.toLocaleString():'')+
+    '</div>'+
+    '<table class=dtable style="font:12.5px/1.5 ui-monospace,Menlo,'+
+    'monospace"><tbody>'+
+    d.entries.map(e=>'<tr><td>'+(e.dir?'\u{1F4C1} ':'\u{1F4C4} ')+
+      esc(e.name)+'</td>'+
+      '<td class=op style="text-align:right">'+
+      (e.dir?'':human(e.size))+'</td>'+
+      '<td class=op>'+esc(e.date||'')+'</td></tr>').join('')+
+    '</tbody></table>';
 }
 function viewFailed(el){
   const w = el.closest('.vwrap') || el.parentNode;
@@ -3738,9 +3843,16 @@ function filterTree(){
     const nm = nd.querySelector(':scope > .trow > .nm, :scope > .srow > .nm');
     if(!nm) return;
     let ok = !v || nm.textContent.toLowerCase().includes(v);
-    // Folders stay visible so you can drill into them for shared content.
-    if(ok && hideUn && nd.dataset.shared==='0' && nd.dataset.folder!=='1')
-      ok = false;
+    if(ok && hideUn){
+      // A folder is worth keeping only if it is shared itself or leads to
+      // something shared. Keeping every folder — as this used to — meant
+      // the filter changed nothing at the top level, where every row is a
+      // folder, so it looked broken.
+      if(nd.dataset.folder==='1'){
+        const inside = parseInt(nd.dataset.sharedin||'0', 10);
+        if(nd.dataset.shared!=='1' && !inside) ok = false;
+      } else if(nd.dataset.shared!=='1') ok = false;
+    }
     nd.style.display = ok?'':'none';
   });
 }
@@ -3799,16 +3911,104 @@ async function pollSweep(){
         return;
       }
       if(s.done){
-        if(head) head.innerHTML = '<strong>'+
-          s.shared_count.toLocaleString()+' shared item'+
-          (s.shared_count===1?'':'s')+'</strong> in your Drive, scanned at '+
-          esc(s.at)+'. Each folder shows how many are inside it.';
+        // Lead with exposure, because that is the question the tab exists
+        // to answer: what is out there, and who can see it.
+        if(head){
+          const bits = [];
+          if(s.public) bits.push('<strong style="color:var(--crit)">'+
+            s.public.toLocaleString()+' item'+(s.public===1?' is':'s are')+
+            ' public on the web</strong> — anyone with the link can open '+
+            (s.public===1?'it':'them')+'.');
+          bits.push('<strong>'+s.shared_count.toLocaleString()+
+            ' shared item'+(s.shared_count===1?'':'s')+'</strong> in your '+
+            'Drive, with '+s.people_total.toLocaleString()+' '+
+            (s.people_total===1?'person or group':'people or groups')+
+            '. Scanned at '+esc(s.at)+'.');
+          if(s.capped) bits.push('<span class=muted>Access details were '+
+            'read for the first '+s.cap.toLocaleString()+' items.</span>');
+          head.innerHTML = bits.join('<br>');
+        }
+        SWEEP = s;
+        drawPeople(s);
         SWEEP_DONE = true;
         await paintShareBadges();
       }
       return;
     }
   } finally { sweepPolling = false; }
+}
+// Who can see your files, most exposure first. Clicking a person answers
+// "what exactly can they see?" and lets you revoke it in one place.
+let SWEEP = null;
+function drawPeople(s){
+  const el = document.getElementById('people');
+  if(!el) return;
+  if(!s.people || !s.people.length){ el.style.display='none'; return; }
+  el.style.display = '';
+  el.innerHTML = '<div class=panel style="margin:0 0 12px">'+
+    '<div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;'+
+    'margin-bottom:9px"><strong>Who your files are shared with</strong>'+
+    '<span class=muted style="font-size:12.5px">click a name to see '+
+    'exactly what they can open</span></div>'+
+    '<div class=cats>'+
+    s.people.map(p=>'<button class="cat person'+
+      (p.type==='anyone'?' public':'')+'" onclick="showPerson(\''+
+      esc(p.who).replace(/'/g,"\\'")+'\')" title="'+
+      esc(p.roles.join(', '))+'">'+
+      (p.type==='anyone'?'\u{1F310} ':(p.type==='domain'?'\u{1F3E2} '
+        :'\u{1F464} '))+
+      esc(p.who)+'<span class=cnt>'+p.count.toLocaleString()+'</span>'+
+      '</button>').join('')+
+    '</div>'+
+    (s.people_total>s.people.length
+      ? '<div class=muted style="font-size:11.5px;margin-top:8px">showing '+
+        'the '+s.people.length+' with the most access, of '+
+        s.people_total.toLocaleString()+'</div>' : '')+
+    '</div>';
+}
+// The flat list of everything one person can reach, with revoke in place.
+async function showPerson(who){
+  const st = document.getElementById('stree');
+  st.innerHTML = '<div class=muted style="padding:6px"><span class=spin>'+
+    '</span> gathering what '+esc(who)+' can see&hellip;</div>';
+  let d;
+  try{ d = await api('/api/shared?who='+encodeURIComponent(who)); }
+  catch(e){
+    st.innerHTML = '<div class=warn style="padding:6px">'+esc(niceErr(e))+
+      '</div>';
+    return;
+  }
+  st.innerHTML =
+    '<div class=note style="margin:0 0 10px"><strong>'+esc(who)+
+    '</strong> can open '+d.total.toLocaleString()+' item'+
+    (d.total===1?'':'s')+'. Removing access here affects only this '+
+    'person.<br><button class="btn ghost" style="margin-top:9px" '+
+    'onclick="backToShareTree()">&larr; Back to the folder tree</button>'+
+    '</div>'+
+    d.items.map(it=>{
+      const p = (it.perms||[]).find(x=>(x.email||x.domain||
+        (x.type==='anyone'?'Anyone with the link':x.type))===who);
+      return '<div class=tnode data-path="'+esc(it.path)+'" data-id="'+
+        esc(it.id)+'" data-folder="'+(it.folder?1:0)+'" data-shared="1">'+
+        '<div class=srow onclick="rowToggle(this,event)">'+
+        '<span class=tw></span><span class=ic>'+icon(it)+'</span>'+
+        '<span class=nm title="'+esc(it.path)+'">'+esc(it.name)+
+        '<span class=hint style="margin-left:7px">'+
+        esc(parentOf(it.path)||'My Drive')+'</span></span>'+
+        (it.public?'<span class="tag stay" style="color:var(--crit)">'+
+          'public</span>':'')+
+        (p?'<span class=perms>'+permChip(it.id,p,it.can_share!==false)+
+          '</span>':'')+
+        '</div></div>';
+    }).join('')+
+    (d.total>d.items.length
+      ? '<div class=muted style="padding:8px">showing the first '+
+        d.items.length.toLocaleString()+' of '+d.total.toLocaleString()+
+        '</div>' : '');
+}
+function backToShareTree(){
+  document.getElementById('stree').dataset.loaded='';
+  bootShare();
 }
 // Add/refresh the "N shared inside" badges on rows already rendered.
 async function paintShareBadges(){
@@ -3827,6 +4027,7 @@ async function paintShareBadges(){
     const row = nd.querySelector(':scope > .srow');
     if(!row) return;
     const n = d.counts[nd.dataset.id] || 0;
+    nd.dataset.sharedin = n;      // keeps the "only shared" filter honest
     let tag = row.querySelector('.sharedin');
     if(!n){ if(tag) tag.remove(); return; }
     if(!tag){
@@ -3865,7 +4066,7 @@ function srowHtml(n){
   const chips = (n.perms||[]).map(p=>permChip(n.id,p,canManage)).join('');
   return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
     esc(n.id)+'" data-shared="'+(n.shared?1:0)+'" data-folder="'+
-    (n.folder?1:0)+'">'+
+    (n.folder?1:0)+'" data-sharedin="'+(n.shared_inside||0)+'">'+
     '<div class=srow onclick="rowToggle(this,event)">'+
     '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
     '<span class=ic>'+icon(n)+'</span>'+
@@ -4247,13 +4448,21 @@ async function loadRuns(){
   try{ d = await api('/api/runs'); }catch(e){ return; }
   const el = document.getElementById('runs');
   if(!el) return;
+  const totalRuns = d.runs.length;
+  const totalItems = d.runs.reduce((a,r)=>a+(r.moves||0),0);
+  const sum = document.getElementById('runsum');
+  if(sum) sum.textContent = totalRuns
+    ? totalRuns.toLocaleString()+' revision'+(totalRuns===1?'':'s')+
+      ' · '+totalItems.toLocaleString()+' item'+(totalItems===1?'':'s')+
+      ' organized'
+    : '';
   el.innerHTML = d.runs.length
     ? d.runs.map((r,i)=>
         '<div class=pi><span class=a title="'+esc(r.log)+'">'+esc(r.when)+
         (r.kind!=='ui'?' <span class=muted style="font-size:11px">('+
           esc(r.kind)+')</span>':'')+'</span>'+
         '<span class=muted style="font-size:12px;white-space:nowrap">'+
-        r.moves+' move'+(r.moves===1?'':'s')+'</span>'+
+        r.moves+' organized</span>'+
         '<span class=menuwrap>'+
         '<button class=dots title="actions" onclick="toggleMenu(event,'+i+
           ')">&#8942;</button>'+
@@ -4503,7 +4712,8 @@ def run_ui(args) -> None:
     # open everything.
     sweep: Dict[str, Any] = {"running": False, "done": False, "seen": 0,
                              "shared_count": 0, "folders": {}, "at": "",
-                             "error": ""}
+                             "error": "", "people": [], "items": [],
+                             "public": 0, "detailed": 0, "phase": ""}
     sweep_lock = threading.Lock()
 
     def start_sweep() -> bool:
@@ -4519,40 +4729,103 @@ def run_ui(args) -> None:
             if sweep["running"]:
                 return False
             sweep.update(running=True, done=False, seen=0, shared_count=0,
-                         folders={}, error="")
+                         folders={}, error="", people=[], items=[],
+                         public=0, detailed=0, phase="scanning")
         threading.Thread(target=sweep_worker, daemon=True).start()
         return True
 
     def sweep_worker() -> None:
         parents_map: Dict[str, Optional[str]] = {}
-        shared_ids: List[str] = []
+        names: Dict[str, str] = {}
+        shared: List[Dict[str, Any]] = []
         token = None
         try:
             while True:
                 resp = locked(service.files().list(
                     q="trashed = false", corpora="user",
-                    fields="nextPageToken, files(id,parents,shared)",
+                    fields="nextPageToken, files(id,name,parents,shared,"
+                           "mimeType,webViewLink,ownedByMe,"
+                           "capabilities(canShare))",
                     pageSize=1000, pageToken=token))
                 batch = resp.get("files", [])
                 sweep["seen"] += len(batch)
                 for f in batch:
                     parents_map[f["id"]] = (f.get("parents") or [None])[0]
+                    names[f["id"]] = f.get("name", "")
                     if f.get("shared"):
-                        shared_ids.append(f["id"])
+                        shared.append(f)
                 token = resp.get("nextPageToken")
                 if not token:
                     break
+
             counts: Dict[str, int] = {}
-            for fid in shared_ids:
-                cur = parents_map.get(fid)
+            for f in shared:
+                cur = parents_map.get(f["id"])
                 hops = 0
                 while cur and hops < 200:
                     counts[cur] = counts.get(cur, 0) + 1
                     cur = parents_map.get(cur)
                     hops += 1
             sweep["folders"] = counts
-            sweep["shared_count"] = len(shared_ids)
+            sweep["shared_count"] = len(shared)
+
+            def path_for(fid: str) -> str:
+                parts: List[str] = []
+                cur: Optional[str] = fid
+                hops = 0
+                while cur and hops < 200:
+                    nm = names.get(cur)
+                    if nm is None:
+                        break
+                    parts.append(nm)
+                    cur = parents_map.get(cur)
+                    hops += 1
+                return "/".join(reversed(parts))
+
+            # Who each shared item is exposed to. One permissions call per
+            # shared item, so it is capped and reported honestly rather
+            # than silently truncated.
+            sweep["phase"] = "reading permissions"
+            tally: Dict[str, Dict[str, Any]] = {}
+            items: List[Dict[str, Any]] = []
+            public = 0
+            for f in shared[:MAX_SHARE_DETAIL]:
+                if not sweep["running"]:
+                    break
+                perms = perms_of(f["id"])
+                sweep["detailed"] += 1
+                if not perms:
+                    continue
+                is_public = any(p["type"] == "anyone" for p in perms)
+                if is_public:
+                    public += 1
+                for p in perms:
+                    who = (p["email"] or p["domain"]
+                           or ("Anyone with the link"
+                               if p["type"] == "anyone" else p["type"]))
+                    slot = tally.setdefault(who, {
+                        "who": who, "type": p["type"], "count": 0,
+                        "roles": set()})
+                    slot["count"] += 1
+                    slot["roles"].add(p["role"])
+                items.append({
+                    "id": f["id"], "name": f.get("name", ""),
+                    "path": path_for(f["id"]),
+                    "folder": f.get("mimeType") == FOLDER_MIME,
+                    "mime": f.get("mimeType", ""),
+                    "link": f.get("webViewLink", ""),
+                    "public": is_public,
+                    "can_share": bool(f.get("ownedByMe", True)) and bool(
+                        (f.get("capabilities") or {}).get("canShare", True)),
+                    "perms": perms})
+            sweep["people"] = sorted(
+                ({"who": v["who"], "type": v["type"], "count": v["count"],
+                  "roles": sorted(v["roles"])} for v in tally.values()),
+                key=lambda p: -p["count"])
+            sweep["items"] = items
+            sweep["public"] = public
             sweep["at"] = datetime.now().strftime("%H:%M")
+            sweep["phase"] = ""
             sweep["done"] = True
         except Exception as err:
             sweep["error"] = f"{type(err).__name__}: {err}"
@@ -4581,7 +4854,7 @@ def run_ui(args) -> None:
     folder_index: Dict[str, Any] = {"ready": False, "building": False,
                                     "paths": [], "known": set(), "count": 0,
                                     "at": "", "error": "", "expected": 0,
-                                    "stale": False}
+                                    "stale": False, "again": False}
     findex_lock = threading.Lock()
     FINDEX_FILE = os.path.join(LOG_DIR, "folder_index.json")
 
@@ -4635,8 +4908,15 @@ def run_ui(args) -> None:
     def build_folder_index() -> None:
         with findex_lock:
             if folder_index["building"]:
+                # A rebuild was asked for while one is already running —
+                # two executions finishing close together. The running
+                # crawl may have started BEFORE the second run's moves, so
+                # its result would already be stale. Remember that another
+                # pass is owed instead of dropping the request, and run it
+                # when this one finishes.
+                folder_index["again"] = True
                 return
-            folder_index.update(building=True, error="")
+            folder_index.update(building=True, error="", again=False)
         try:
             by_id: Dict[str, Tuple[str, Optional[str]]] = {}
             pending: Set[str] = set()
@@ -4730,7 +5010,13 @@ def run_ui(args) -> None:
         except Exception as err:
             folder_index["error"] = f"{type(err).__name__}: {err}"
         finally:
-            folder_index["building"] = False
+            with findex_lock:
+                folder_index["building"] = False
+                owed = folder_index.get("again", False)
+                folder_index["again"] = False
+            if owed:
+                threading.Thread(target=build_folder_index,
+                                 daemon=True).start()
 
     def search_folders(q: str, limit: int = 60) -> List[str]:
         """Same token rules as the picker: every token must appear, and a
@@ -5029,6 +5315,53 @@ def run_ui(args) -> None:
                 self.end_headers()
                 self.wfile.write(logo_bytes)
                 return
+            if u.path == "/api/zip":
+                # Lists what is inside an archive without extracting it.
+                # Nothing is written anywhere: the bytes are read into
+                # memory, the central directory is parsed, and the listing
+                # is returned.
+                q = urllib.parse.parse_qs(u.query)
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                fid = (q.get("id") or [""])[0]
+                try:
+                    meta = locked(service.files().get(
+                        fileId=fid, fields="id,name,size"))
+                    size = int(meta.get("size") or 0)
+                    if size > MAX_ZIP_BYTES:
+                        self._send({"error": f"archive is {human(size)}; "
+                                             f"the listing limit is "
+                                             f"{human(MAX_ZIP_BYTES)}"}, 413)
+                        return
+                    with api_lock:
+                        blob = with_backoff(service.files().get_media(
+                            fileId=fid).execute)
+                    entries = []
+                    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                        for info in z.infolist()[:MAX_ZIP_ENTRIES]:
+                            entries.append({
+                                "name": info.filename,
+                                "dir": info.is_dir(),
+                                "size": info.file_size,
+                                "packed": info.compress_size,
+                                "date": ("%04d-%02d-%02d" % info.date_time[:3]
+                                         if info.date_time[0] >= 1980
+                                         else "")})
+                        total = len(z.infolist())
+                except zipfile.BadZipFile:
+                    self._send({"error": "not a readable zip archive"}, 415)
+                    return
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"},
+                               500)
+                    return
+                self._send({"name": meta.get("name", ""), "entries": entries,
+                            "total": total,
+                            "truncated": total > len(entries),
+                            "bytes": sum(e["size"] for e in entries)})
+                return
+
             if u.path == "/api/file":
                 # Streams a file's own bytes so previews show the real
                 # thing. <img> and <iframe> cannot send headers, so this
@@ -5162,7 +5495,32 @@ def run_ui(args) -> None:
                 self._send({"running": sweep["running"],
                             "done": sweep["done"], "seen": sweep["seen"],
                             "shared_count": sweep["shared_count"],
+                            "people": sweep["people"][:60],
+                            "people_total": len(sweep["people"]),
+                            "public": sweep["public"],
+                            "detailed": sweep["detailed"],
+                            "capped": sweep["shared_count"] >
+                                      MAX_SHARE_DETAIL,
+                            "cap": MAX_SHARE_DETAIL,
+                            "phase": sweep["phase"],
                             "at": sweep["at"], "error": sweep["error"]})
+                return
+            if u.path == "/api/shared":
+                # The flat list behind the exposure summary: every shared
+                # item, optionally narrowed to one person.
+                q = urllib.parse.parse_qs(u.query)
+                who = (q.get("who") or [""])[0]
+                items = sweep["items"]
+                if who:
+                    items = [it for it in items
+                             if any((p["email"] or p["domain"]
+                                     or ("Anyone with the link"
+                                         if p["type"] == "anyone"
+                                         else p["type"])) == who
+                                    for p in it["perms"])]
+                self._send({"items": items[:1000],
+                            "total": len(items),
+                            "who": who})
                 return
             if u.path == "/api/run":
                 q = urllib.parse.parse_qs(u.query)

@@ -72,9 +72,13 @@ what you see is what's actually there — not a snapshot.
 - **Organise** — browse, assign destinations, preview, execute. Rows you've
   annotated are tinted; anything that will be carried along by a planned
   parent is tinted lighter.
-- **Sharing** — every shared item with the people it's shared with. Folders
-  show how many shared items are anywhere beneath them, so you follow the
-  trail down instead of clicking blindly. Remove access with one click.
+- **Sharing** — an exposure audit. It opens by telling you what's actually
+  at risk: **how many items are public on the web**, how many people and
+  groups can reach your files, and who they are — ranked by how much each
+  can see. Click a person to get the exact list of everything they can
+  open, and revoke access from that list. Folders show how many shared
+  items are anywhere beneath them, so you follow the trail down instead of
+  clicking blindly.
 - **Trash** — view and restore. Deliberately **no** empty-trash or
   permanent-delete capability.
 
@@ -85,10 +89,12 @@ aren't required to have one.
 
 **Click any file to view it.** Images, PDFs, video, audio and text or code
 files are streamed through the local server and shown inline, and Google
-Docs, Sheets and Slides are rendered to PDF for preview. Every file also
-offers **Copy link**, **Copy path**, **Download**, and **Open in Drive**.
-Previews are capped at 25 MB; anything larger or in a format the browser
-can't render says so and links out instead.
+Docs, Sheets and Slides are rendered to PDF for preview. **ZIP archives
+list their contents** — read from the archive's own directory, so nothing
+is extracted and nothing is written to disk. Every file also offers **Copy
+link**, **Copy path**, **Download**, and **Open in Drive**. Previews are
+capped at 25 MB; anything larger or in a format the browser can't render
+says so and links out instead.
 
 Destination search indexes every folder in your Drive, so you can file
 something into a folder 12 levels deep that you've never opened. Search
