@@ -21,7 +21,7 @@ don't have to.
 The strongest things it can do are:
 
 | Action | Reversible by | Notes |
-|---|---|---|
+| --- | --- | --- |
 | Move a file or folder | `undo <log>` | The only action `apply` performs |
 | Trash a **verifiably empty** folder | `undo`, or Drive's trash | Emptiness re-checked server-side at the moment you click |
 | Trash a duplicate you confirmed | `undo`, or Drive's trash | One explicit click per item, in `review` |
@@ -77,6 +77,18 @@ what you see is what's actually there — not a snapshot.
   trail down instead of clicking blindly. Remove access with one click.
 - **Trash** — view and restore. Deliberately **no** empty-trash or
   permanent-delete capability.
+
+Files carry an icon for their actual type — images, video, audio, PDFs,
+Docs/Sheets/Slides, archives, code, fonts, keys, databases — resolved from
+the MIME type with the file extension as a fallback, since Drive names
+aren't required to have one.
+
+**Click any file to view it.** Images, PDFs, video, audio and text or code
+files are streamed through the local server and shown inline, and Google
+Docs, Sheets and Slides are rendered to PDF for preview. Every file also
+offers **Copy link**, **Copy path**, **Download**, and **Open in Drive**.
+Previews are capped at 25 MB; anything larger or in a format the browser
+can't render says so and links out instead.
 
 Destination search indexes every folder in your Drive, so you can file
 something into a folder 12 levels deep that you've never opened. Search
@@ -171,7 +183,7 @@ python gdrive_organizer.py undo logs/apply_20260805_143036.jsonl --execute
 ### All commands
 
 | Command | What it does | |
-|---|---|---|
+| --- | --- | --- |
 | `ui` | Live interface — browse your real Drive and organise it | |
 | `scan` | Crawl and produce the report + inventory baseline | *read only* |
 | `retree` | Rebuild report and tree from the last scan, no crawl | *read only* |
@@ -196,7 +208,7 @@ Useful flags:
 
 ## Where things go
 
-```
+```text
 credentials.json      your OAuth client         — gitignored
 token.json            your cached grant         — gitignored
 drive_scan/           inventory + reports       — gitignored
@@ -241,6 +253,9 @@ The things worth knowing before you trust it with 190,000 files:
   answer wins where they disagree.
 - **Duplicate detection needs content hashes.** Google-native files (Docs,
   Sheets, Slides) don't have them and are never treated as duplicates.
+- **Some files can't be typed by anyone.** Drive reports no MIME and the
+  name has no extension — those get a generic icon and no preview. In a
+  190k-file Drive that was about 14% of files, nearly all build artefacts.
 - **Same-named sibling folders collapse** to one entry in destination
   search, and the resolver picks the first match.
 

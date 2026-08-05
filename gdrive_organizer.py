@@ -1642,6 +1642,16 @@ def preview_html(ops: List[Dict[str, Any]], creates: List[str],
 
 QUARANTINE = "Duplicates"
 
+# Preview limits and conversions for the live UI's file viewer.
+MAX_PREVIEW_BYTES = 25 * 1024 * 1024
+EXPORT_AS = {
+    "application/vnd.google-apps.document": "application/pdf",
+    "application/vnd.google-apps.presentation": "application/pdf",
+    "application/vnd.google-apps.spreadsheet": "application/pdf",
+    "application/vnd.google-apps.drawing": "image/png",
+    "application/vnd.google-apps.script": "application/json",
+}
+
 
 # ---------------------------------------------------------------------------
 # Plan building
@@ -2563,6 +2573,15 @@ color:var(--muted);padding:8px 8px 3px;font-weight:650}
 .pickempty{color:var(--muted);font-size:12.5px;padding:8px}
 .picknote{color:var(--muted);font-size:11.5px;padding:7px 8px;
 border-top:1px solid var(--grid);margin-top:5px}
+.vwrap{text-align:center;margin:12px 0;background:var(--plane);
+border:1px solid var(--ring);border-radius:10px;overflow:hidden}
+.vimg{max-width:100%;max-height:62vh;display:block;margin:0 auto}
+.vframe{width:100%;height:66vh;border:1px solid var(--ring);
+border-radius:10px;margin:12px 0;background:#fff}
+.vtext{background:var(--plane);border:1px solid var(--ring);
+border-radius:10px;padding:13px;max-height:62vh;overflow:auto;margin:12px 0;
+font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+white-space:pre-wrap;overflow-wrap:anywhere}
 .dtable{width:100%;border-collapse:collapse;font-size:12.5px}
 .dtable td{padding:5px 7px;border-bottom:1px solid var(--grid);
 vertical-align:top;overflow-wrap:anywhere}
@@ -2922,7 +2941,114 @@ async function delCat(c){
 }
 
 // ---- tree
-function icon(n){ return n.folder?'&#128193;':'&#128196;'; }
+// Icons come from the MIME type first and the extension only as a fallback,
+// because Drive names are not required to have one.
+const EXT_ICON = {
+  pdf:'\u{1F4D5}', doc:'\u{1F4DD}', docx:'\u{1F4DD}', rtf:'\u{1F4DD}',
+  odt:'\u{1F4DD}', txt:'\u{1F4C4}', md:'\u{1F4C4}', log:'\u{1F4C4}',
+  xls:'\u{1F4CA}', xlsx:'\u{1F4CA}', csv:'\u{1F4CA}', ods:'\u{1F4CA}',
+  ppt:'\u{1F4FD}', pptx:'\u{1F4FD}', odp:'\u{1F4FD}', key:'\u{1F4FD}',
+  zip:'\u{1F5DC}', rar:'\u{1F5DC}', '7z':'\u{1F5DC}', tar:'\u{1F5DC}',
+  gz:'\u{1F5DC}', bz2:'\u{1F5DC}', dmg:'\u{1F5DC}', iso:'\u{1F5DC}',
+  jpg:'\u{1F5BC}', jpeg:'\u{1F5BC}', png:'\u{1F5BC}', gif:'\u{1F5BC}',
+  webp:'\u{1F5BC}', svg:'\u{1F5BC}', bmp:'\u{1F5BC}', tif:'\u{1F5BC}',
+  tiff:'\u{1F5BC}', heic:'\u{1F5BC}', ico:'\u{1F5BC}',
+  psd:'\u{1F3A8}', ai:'\u{1F3A8}', eps:'\u{1F3A8}', sketch:'\u{1F3A8}',
+  fig:'\u{1F3A8}', xd:'\u{1F3A8}', indd:'\u{1F3A8}',
+  mp4:'\u{1F3AC}', mov:'\u{1F3AC}', avi:'\u{1F3AC}', mkv:'\u{1F3AC}',
+  webm:'\u{1F3AC}', wmv:'\u{1F3AC}', flv:'\u{1F3AC}', m4v:'\u{1F3AC}',
+  mp3:'\u{1F3B5}', wav:'\u{1F3B5}', flac:'\u{1F3B5}', aac:'\u{1F3B5}',
+  ogg:'\u{1F3B5}', m4a:'\u{1F3B5}', wma:'\u{1F3B5}',
+  js:'\u{1F4DC}', ts:'\u{1F4DC}', jsx:'\u{1F4DC}', tsx:'\u{1F4DC}',
+  py:'\u{1F4DC}', rb:'\u{1F4DC}', php:'\u{1F4DC}', java:'\u{1F4DC}',
+  c:'\u{1F4DC}', h:'\u{1F4DC}', cpp:'\u{1F4DC}', cs:'\u{1F4DC}',
+  go:'\u{1F4DC}', rs:'\u{1F4DC}', swift:'\u{1F4DC}', kt:'\u{1F4DC}',
+  sh:'\u{1F4DC}', bat:'\u{1F4DC}', ps1:'\u{1F4DC}', sql:'\u{1F4DC}',
+  html:'\u{1F310}', htm:'\u{1F310}', css:'\u{1F3A8}', scss:'\u{1F3A8}',
+  json:'\u{1F9E9}', xml:'\u{1F9E9}', yml:'\u{1F9E9}', yaml:'\u{1F9E9}',
+  toml:'\u{1F9E9}', ini:'\u{1F9E9}', env:'\u{1F9E9}',
+  ttf:'\u{1F524}', otf:'\u{1F524}', woff:'\u{1F524}', woff2:'\u{1F524}',
+  eot:'\u{1F524}',
+  exe:'\u{2699}', msi:'\u{2699}', apk:'\u{2699}', deb:'\u{2699}',
+  bin:'\u{2699}', dat:'\u{2699}', pak:'\u{2699}', install:'\u{2699}',
+  bunx:'\u{2699}', wasm:'\u{2699}', swf:'\u{2699}',
+  pem:'\u{1F511}', crt:'\u{1F511}', p12:'\u{1F511}', pub:'\u{1F511}',
+  ppk:'\u{1F511}', cer:'\u{1F511}', pfx:'\u{1F511}',
+  // Web/build files, which dominate any Drive holding old project folders.
+  mjs:'\u{1F4DC}', cjs:'\u{1F4DC}', cts:'\u{1F4DC}', mts:'\u{1F4DC}',
+  twig:'\u{1F4DC}', jst:'\u{1F4DC}', stml:'\u{1F4DC}', tpl:'\u{1F4DC}',
+  module:'\u{1F4DC}', inc:'\u{1F4DC}', phpt:'\u{1F4DC}', pl:'\u{1F4DC}',
+  coffee:'\u{1F4DC}', cmd:'\u{1F4DC}', flow:'\u{1F4DC}', vue:'\u{1F4DC}',
+  svelte:'\u{1F4DC}', lua:'\u{1F4DC}', r:'\u{1F4DC}', scala:'\u{1F4DC}',
+  less:'\u{1F3A8}', sass:'\u{1F3A8}', styl:'\u{1F3A8}', drawio:'\u{1F3A8}',
+  map:'\u{1F9E9}', lock:'\u{1F9E9}', cfg:'\u{1F9E9}', conf:'\u{1F9E9}',
+  properties:'\u{1F9E9}', plist:'\u{1F9E9}', htaccess:'\u{1F9E9}',
+  db:'\u{1F5C4}', sqlite:'\u{1F5C4}', sqlite3:'\u{1F5C4}', mdb:'\u{1F5C4}',
+  po:'\u{1F4C4}', mo:'\u{1F4C4}', pot:'\u{1F4C4}', 'svn-base':'\u{1F4C4}'
+};
+const GOOGLE_ICON = {
+  document:'\u{1F4DD}', spreadsheet:'\u{1F4CA}', presentation:'\u{1F4FD}',
+  form:'\u{1F4CB}', drawing:'\u{1F3A8}', script:'\u{1F4DC}',
+  'shortcut':'\u{1F517}', 'map':'\u{1F5FA}', 'site':'\u{1F310}',
+  'jam':'\u{1F5D2}', 'fusiontable':'\u{1F4CA}'
+};
+// Types Drive reports as text/code even when the name carries no extension.
+const TEXT_MIME = ['application/x-shellscript','application/x-sh',
+  'application/x-perl','application/x-python','application/x-ruby',
+  'application/x-httpd-php','application/javascript',
+  'application/x-javascript','application/typescript','application/sql',
+  'application/x-yaml','application/yaml','application/toml',
+  'application/graphql','application/x-tex'];
+function icon(n){
+  if(n.folder) return '\u{1F4C1}';
+  const m = String(n.mime||'');
+  if(m.indexOf('application/vnd.google-apps.')===0){
+    const kind = m.slice('application/vnd.google-apps.'.length);
+    return GOOGLE_ICON[kind] || '\u{1F4C4}';
+  }
+  if(m.indexOf('image/')===0) return '\u{1F5BC}';
+  if(m.indexOf('video/')===0) return '\u{1F3AC}';
+  if(m.indexOf('audio/')===0) return '\u{1F3B5}';
+  if(m==='application/pdf') return '\u{1F4D5}';
+  if(m.indexOf('zip')>-1 || m.indexOf('compressed')>-1 ||
+     m.indexOf('tar')>-1 || m.indexOf('rar')>-1) return '\u{1F5DC}';
+  if(TEXT_MIME.indexOf(m)>-1) return '\u{1F4DC}';
+  const name = String(n.name||'');
+  const dot = name.lastIndexOf('.');
+  if(dot>-1){
+    const ext = name.slice(dot+1).toLowerCase();
+    if(EXT_ICON[ext]) return EXT_ICON[ext];
+  }
+  if(m.indexOf('text/')===0) return '\u{1F4C4}';
+  return '\u{1F4C4}';
+}
+// What the viewer can show inline, decided the same way as the icon.
+function fileKind(n){
+  const m = String(n.mime||'');
+  const name = String(n.name||'');
+  const ext = name.lastIndexOf('.')>-1
+    ? name.slice(name.lastIndexOf('.')+1).toLowerCase() : '';
+  if(m.indexOf('image/')===0) return 'image';
+  if(m==='application/pdf') return 'pdf';
+  if(m==='application/vnd.google-apps.drawing') return 'image';
+  if(m==='application/vnd.google-apps.script') return 'text';
+  if(m.indexOf('application/vnd.google-apps.')===0)
+    return ['document','spreadsheet','presentation'].indexOf(
+      m.slice(28))>-1 ? 'pdf' : 'none';
+  if(m.indexOf('video/')===0) return 'video';
+  if(m.indexOf('audio/')===0) return 'audio';
+  if(m.indexOf('text/')===0 || m==='application/json' ||
+     m==='application/xml' || TEXT_MIME.indexOf(m)>-1 ||
+     ['txt','md','log','csv','json','xml','yml','yaml','ini','env','toml',
+      'js','ts','jsx','tsx','py','rb','php','java','c','h','cpp','cs','go',
+      'rs','swift','kt','sh','bat','ps1','sql','css','scss','html','htm',
+      'mjs','cjs','cts','mts','twig','jst','stml','tpl','module','inc',
+      'phpt','pl','coffee','cmd','flow','vue','svelte','lua','r','scala',
+      'less','sass','styl','map','lock','cfg','conf','properties','po',
+      'pot','htaccess','svn-base'
+     ].indexOf(ext)>-1) return 'text';
+  return 'none';
+}
 async function children(id, path){
   if(CACHE[id]) return CACHE[id];
   const d = await api('/api/children?id='+encodeURIComponent(id)+
@@ -3414,29 +3540,114 @@ function findItem(id){
   const t = TCACHE.find(i=>i.id===id); if(t) return t;
   return null;
 }
-// Viewer: an in-page preview for images (Drive thumbnails scale up well),
-// details plus an Open-in-Drive link for everything else.
+// Copy to clipboard. The page is served from 127.0.0.1, which browsers
+// treat as a secure context, so the async API is available; the textarea
+// fallback covers older ones.
+async function copyText(text, btn){
+  let ok = false;
+  try{
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  }catch(e){
+    try{
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+    }catch(e2){ ok = false; }
+  }
+  if(btn){
+    const was = btn.innerHTML;
+    btn.innerHTML = ok ? '\u2713 Copied' : 'Press Ctrl+C';
+    if(!ok){ window.prompt('Copy this link:', text); }
+    setTimeout(()=>{ btn.innerHTML = was; }, 1600);
+  }
+  return ok;
+}
+// Viewer: shows the file itself — images, PDFs (including Docs, Sheets and
+// Slides rendered to PDF), video, audio and text are streamed through this
+// server, which already holds the Drive credentials.
+function fileUrl(id){
+  return '/api/file?t='+encodeURIComponent(TOKEN)+
+         '&id='+encodeURIComponent(id);
+}
 function viewFile(id){
   const it = findItem(id);
   if(!it) return;
-  const img = (it.thumb||'').replace(/=s\d+(-c)?$/,'=s1600');
+  const kind = fileKind(it);
+  const url = fileUrl(it.id);
   const box = document.getElementById('ovbox');
-  box.innerHTML = '<h2 style="margin-top:0;overflow-wrap:anywhere">'+
-    esc(it.name)+'</h2>'+
-    '<p class=muted style="overflow-wrap:anywhere">'+esc(it.path)+
+  const head = '<h2 style="margin-top:0;overflow-wrap:anywhere">'+
+    icon(it)+' '+esc(it.name)+'</h2>'+
+    '<p class=muted style="overflow-wrap:anywhere">'+
+    esc(it.path||it.name)+
     (it.size?' &middot; '+human(it.size):'')+
-    (it.modified?' &middot; modified '+esc(it.modified):'')+'</p>'+
-    (img?'<div style="text-align:center;margin:10px 0">'+
-      '<img src="'+esc(img)+'" alt="preview" style="max-width:100%;'+
-      'max-height:60vh;border-radius:9px;border:1px solid var(--ring)" '+
-      'onerror="this.parentNode.innerHTML='+
-      '\'<p class=muted>Preview could not be loaded.</p>\'"></div>'
-      :'<p class=muted>No preview available for this file type.</p>')+
-    '<div style="display:flex;gap:9px;margin-top:8px">'+
+    (it.modified?' &middot; modified '+esc(it.modified):'')+'</p>';
+  const actions =
+    '<div style="display:flex;gap:9px;margin-top:12px;flex-wrap:wrap">'+
     (it.link?'<a class=btn target=_blank rel=noopener href="'+esc(it.link)+
       '">Open in Drive</a>':'')+
+    (it.link?'<button class="btn ghost" onclick="copyText(\''+
+      esc(it.link).replace(/'/g,"\\'")+'\',this)">Copy link</button>':'')+
+    '<button class="btn ghost" onclick="copyText(\''+
+      esc(it.path||it.name).replace(/'/g,"\\'")+
+      '\',this)">Copy path</button>'+
+    '<a class="btn ghost" href="'+url+'" download="'+esc(it.name)+
+      '">Download</a>'+
     '<button class="btn ghost" onclick=closeOv()>Close</button></div>';
+  let body;
+  if(kind==='image'){
+    body = '<div class=vwrap><img src="'+url+'" alt="'+esc(it.name)+
+      '" class=vimg onerror="viewFailed(this)"></div>';
+  } else if(kind==='pdf'){
+    body = '<iframe class=vframe src="'+url+'" title="'+esc(it.name)+
+      '"></iframe>';
+  } else if(kind==='video'){
+    body = '<div class=vwrap><video class=vimg controls src="'+url+
+      '" onerror="viewFailed(this)"></video></div>';
+  } else if(kind==='audio'){
+    body = '<div class=vwrap style="padding:14px"><audio controls '+
+      'style="width:100%" src="'+url+'" onerror="viewFailed(this)">'+
+      '</audio></div>';
+  } else if(kind==='text'){
+    body = '<pre class=vtext id=vtext><span class=spin></span> '+
+      'loading&hellip;</pre>';
+  } else {
+    body = '<p class=muted>No inline preview for this file type — '+
+      'open it in Drive or download it.</p>';
+  }
+  box.innerHTML = head + body + actions;
   document.getElementById('ov').classList.add('on');
+  if(kind==='text') loadText(url);
+}
+function viewFailed(el){
+  const w = el.closest('.vwrap') || el.parentNode;
+  w.innerHTML = '<p class=muted style="padding:14px">That file could not '+
+    'be displayed here. It may be larger than the 25 MB preview limit, or '+
+    'a format the browser cannot show — open it in Drive instead.</p>';
+}
+async function loadText(url){
+  const pre = document.getElementById('vtext');
+  if(!pre) return;
+  try{
+    const r = await fetch(url);
+    if(!r.ok) throw new Error(await r.text());
+    let t = await r.text();
+    // Enough to read and copy from, without hanging the page on a huge log.
+    const LIMIT = 200000;
+    let clipped = false;
+    if(t.length > LIMIT){ t = t.slice(0, LIMIT); clipped = true; }
+    pre.textContent = t + (clipped ? '\n\n… truncated at '+
+      LIMIT.toLocaleString()+' characters. Download for the whole file.'
+      : '');
+  }catch(e){
+    pre.innerHTML = '<span class=muted>Could not load the text: '+
+      esc(niceErr(e))+'</span>';
+  }
 }
 // Delete an empty folder: confirmed, sent to Drive's trash, logged so the
 // CLI can restore it (undo folder_actions.jsonl --execute).
@@ -4248,8 +4459,7 @@ def run_ui(args) -> None:
                 q=f"'{fid}' in parents and trashed = false",
                 fields="nextPageToken, files(id,name,mimeType,size,"
                        "modifiedTime,shared,owners(emailAddress),"
-                       "ownedByMe,capabilities(canShare),"
-                       "webViewLink,thumbnailLink)",
+                       "ownedByMe,capabilities(canShare),webViewLink)",
                 pageSize=1000, pageToken=token,
                 orderBy="folder,name"))
             out.extend(resp.get("files", []))
@@ -4356,7 +4566,7 @@ def run_ui(args) -> None:
             resp = locked(service.files().list(
                 q="trashed = true and 'me' in owners",
                 fields="nextPageToken, files(id,name,mimeType,size,"
-                       "modifiedTime,webViewLink,thumbnailLink)",
+                       "modifiedTime,webViewLink)",
                 pageSize=1000, pageToken=token))
             out.extend(resp.get("files", []))
             token = resp.get("nextPageToken")
@@ -4819,6 +5029,53 @@ def run_ui(args) -> None:
                 self.end_headers()
                 self.wfile.write(logo_bytes)
                 return
+            if u.path == "/api/file":
+                # Streams a file's own bytes so previews show the real
+                # thing. <img> and <iframe> cannot send headers, so this
+                # one authenticates on the query token instead — same
+                # secret, same localhost-only Host check.
+                q = urllib.parse.parse_qs(u.query)
+                if not self._local() or (q.get("t") or [""])[0] != auth:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                fid = (q.get("id") or [""])[0]
+                try:
+                    meta = locked(service.files().get(
+                        fileId=fid, fields="id,name,mimeType,size"))
+                    mime = meta.get("mimeType", "")
+                    size = int(meta.get("size") or 0)
+                    if size > MAX_PREVIEW_BYTES:
+                        self._send({"error": "too large to preview"}, 413)
+                        return
+                    if mime.startswith("application/vnd.google-apps."):
+                        # Native Docs/Sheets/Slides have no bytes of their
+                        # own; export a PDF rendering to preview instead.
+                        export = EXPORT_AS.get(mime)
+                        if not export:
+                            self._send({"error": "no preview for this "
+                                                 "Google file type"}, 415)
+                            return
+                        with api_lock:
+                            data = with_backoff(service.files().export_media(
+                                fileId=fid, mimeType=export).execute)
+                        ctype = export
+                    else:
+                        with api_lock:
+                            data = with_backoff(service.files().get_media(
+                                fileId=fid).execute)
+                        ctype = mime or "application/octet-stream"
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"},
+                               500)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", "inline")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if not self._authed():
                 self._send({"error": "forbidden"}, 403)
                 return
@@ -4846,6 +5103,7 @@ def run_ui(args) -> None:
                         "path": (parent_path + "/" + k.get("name", ""))
                                 if parent_path else k.get("name", ""),
                         "folder": folder,
+                        "mime": k.get("mimeType", ""),
                         "size": int(k.get("size") or 0) if not folder else 0,
                         "files": st.get("files") if folder else None,
                         "bytes": st.get("bytes") if folder else None,
@@ -4858,7 +5116,6 @@ def run_ui(args) -> None:
                             (k.get("capabilities") or {}).get(
                                 "canShare", True)),
                         "link": k.get("webViewLink", ""),
-                        "thumb": k.get("thumbnailLink", ""),
                         "modified": (k.get("modifiedTime") or "")[:10]}
                     if want_perms and item["shared"]:
                         item["perms"] = perms_of(k["id"])
@@ -4942,10 +5199,10 @@ def run_ui(args) -> None:
                 titems = [{
                     "id": t["id"], "name": t.get("name", ""),
                     "folder": t.get("mimeType") == FOLDER_MIME,
+                    "mime": t.get("mimeType", ""),
                     "size": int(t.get("size") or 0),
                     "modified": (t.get("modifiedTime") or "")[:10],
-                    "link": t.get("webViewLink", ""),
-                    "thumb": t.get("thumbnailLink", "")} for t in raw]
+                    "link": t.get("webViewLink", "")} for t in raw]
                 self._send({"items": titems, "truncated": truncated})
                 return
             if u.path == "/api/progress":
