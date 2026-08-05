@@ -13,7 +13,9 @@ It has no permanent-delete capability. Everything it can do is reversible:
     logs/trash_actions.jsonl; after 30 days Drive removes them itself,
   * on an explicit click in the ui's Sharing tab, removing one sharing
     permission (who it was is recorded in logs/share_actions.jsonl, and
-    `undo logs/share_actions.jsonl --execute` restores it), or
+    `undo logs/share_actions.jsonl --execute` restores it),
+  * renaming a file or folder (the old name is recorded in
+    logs/rename_actions.jsonl, and undo puts it back), or
   * during `undo`, trashing a folder that the run itself created and that
     is now empty.
 Nothing is destroyed by this tool, and nothing writes without --execute.
@@ -1648,6 +1650,7 @@ MAX_PREVIEW_BYTES = 25 * 1024 * 1024
 MAX_ZIP_BYTES = 100 * 1024 * 1024      # listing only reads the directory
 MAX_ZIP_ENTRIES = 2000
 MAX_SHARE_DETAIL = 1500                # per-item permission lookups
+SEARCH_LIMIT = 200                     # name-search results per query
 EXPORT_AS = {
     "application/vnd.google-apps.document": "application/pdf",
     "application/vnd.google-apps.presentation": "application/pdf",
@@ -2001,6 +2004,12 @@ def run_undo(args) -> None:
                 if args.execute:
                     with_backoff(service.files().update(
                         fileId=fid, body={"trashed": True}).execute)
+                ok += 1
+            elif rec.get("op") == "rename":
+                if args.execute:
+                    with_backoff(service.files().update(
+                        fileId=fid,
+                        body={"name": rec.get("from", "")}).execute)
                 ok += 1
             elif rec.get("op") == "unshare":
                 # Restore a sharing permission removed in the Sharing tab.
@@ -2507,6 +2516,12 @@ min-width:0}
 box-shadow:inset 3px 0 0 var(--s1)}
 .trow.planned:hover{background:rgba(42,120,214,.18)}
 .trow.carried{background:rgba(42,120,214,.05)}
+.trow[draggable=true]{cursor:grab}
+.trow.dragging{opacity:.4;cursor:grabbing}
+.trow.dropok{outline:2px dashed var(--s3);outline-offset:-2px;
+background:rgba(27,175,122,.14)}
+.trow.dropno{outline:2px dashed var(--crit);outline-offset:-2px;
+background:rgba(208,59,59,.10);cursor:not-allowed}
 .tabs{display:flex;gap:6px;margin-bottom:12px;
 border-bottom:1px solid var(--grid);padding-bottom:9px}
 .tab{border:1px solid var(--ring);background:transparent;color:var(--ink2);
@@ -2694,8 +2709,13 @@ the same as deleting in Drive itself. Every change is logged and reversible.
         color:var(--ink2);white-space:nowrap">
         <input type=checkbox id=hideunshared onchange=filterTree()>
         only shared</label>
-      <input id=filter oninput=filterTree() placeholder="filter visible…"
-        style="width:200px">
+      <input id=filter oninput=filterTree()
+        onkeydown="if(event.key==='Enter')runSearch()"
+        placeholder="filter visible — Enter to search all"
+        title="Type to filter what is on screen. Press Enter to search
+your whole Drive by name." style="width:230px">
+      <button class="btn ghost" onclick=runSearch()
+        title="search your whole Drive">&#128269;</button>
       <button id=noask class="btn ghost noask" style="display:none"
         onclick="TRASH_NOASK=false;drawNoAsk()">&#128277;</button>
       <button class="btn ghost" onclick="refreshActive(this)">Refresh</button>
@@ -2703,6 +2723,7 @@ the same as deleting in Drive itself. Every change is logged and reversible.
     <div id=sharehead class=note style="display:none;margin:0 0 12px"></div>
     <div id=people style="display:none"></div>
     <div id=tree class=tree></div>
+    <div id=results class=tree style="display:none"></div>
     <div id=stree class=tree style="display:none"></div>
     <div id=ttree class=tree style="display:none"></div>
   </div>
@@ -2843,6 +2864,45 @@ function uiConfirm(msg, opts){
       if(e.key==='Escape'){ e.preventDefault(); done(false); }
       else if(e.key==='Enter'){ e.preventDefault(); done(true); }
     };
+  });
+}
+// Text-entry dialog, in the same frame as the others. Resolves to the
+// trimmed string, or null if cancelled.
+function uiPrompt(msg, value, opts){
+  opts = opts || {};
+  return new Promise(res=>{
+    const ov = document.getElementById('cfm');
+    document.getElementById('cfm-title').textContent =
+      opts.title || 'Enter a value';
+    document.getElementById('cfm-msg').innerHTML = msg +
+      '<input id=cfm-input style="width:100%;margin-top:12px" '+
+      'autocomplete=off value="'+esc(value||'')+'">';
+    const yes = document.getElementById('cfm-yes');
+    const no = document.getElementById('cfm-no');
+    const inp = document.getElementById('cfm-input');
+    yes.textContent = opts.yes || 'Save';
+    no.textContent = 'Cancel';
+    no.style.display = '';
+    yes.className = 'btn';
+    function done(v){
+      ov.classList.remove('on');
+      yes.onclick = no.onclick = null;
+      ov.onkeydown = null;
+      res(v);
+    }
+    yes.onclick = ()=>done((inp.value||'').trim() || null);
+    no.onclick = ()=>done(null);
+    ov.onkeydown = (e)=>{
+      if(e.key==='Escape'){ e.preventDefault(); done(null); }
+      else if(e.key==='Enter'){
+        e.preventDefault(); done((inp.value||'').trim() || null);
+      }
+    };
+    ov.classList.add('on');
+    inp.focus();
+    // Select the stem, so typing replaces the name but keeps the extension.
+    const dot = (value||'').lastIndexOf('.');
+    if(dot>0) inp.setSelectionRange(0, dot); else inp.select();
   });
 }
 // Branded message box — same dialog, single button. Used for every error
@@ -3174,9 +3234,13 @@ function rowHtml(n){
          'moved since"')
     : '';
   return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
-    esc(n.id)+'" data-folder="'+(n.folder?1:0)+'">'+
+    esc(n.id)+'" data-folder="'+(n.folder?1:0)+'" data-name="'+
+    esc(n.name)+'">'+
     '<div class="trow'+(planned?' planned':(anc?' carried':''))+
-    '" onclick="rowToggle(this,event)">'+
+    '" onclick="rowToggle(this,event)" draggable=true'+
+    ' ondragstart="dragStart(event,this)" ondragend="dragEnd(this)"'+
+    (n.folder?' ondragover="dragOver(event,this)"'+
+      ' ondragleave="dragLeave(this)" ondrop="dropOn(event,this)"':'')+'>'+
     '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
     '<span class=ic>'+icon(n)+'</span>'+
     '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
@@ -3185,6 +3249,10 @@ function rowHtml(n){
       '</span>':'')+
     (n.shared&&n.owned!==false?'<span class="tag stay">shared</span>':'')+
     (n.folder&&n.empty?'<span class="tag stay emptytag">empty</span>':'')+
+    '<button class=rowx title="rename" '+
+    'onclick="event.stopPropagation();renameItem(\''+esc(n.id)+'\',\''+
+    esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
+    ',this)">&#9998;</button>'+
     '<button class=rowx title="move to Drive trash" '+
     'onclick="event.stopPropagation();trashItem(\''+esc(n.id)+'\',\''+
     esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
@@ -3212,7 +3280,7 @@ function destBtn(path, id, name, cur){
     esc(label)+' &#9662;</button>';
 }
 function redrawSelects(){
-  document.querySelectorAll('#tree .tnode').forEach(nd=>{
+  document.querySelectorAll('#tree .tnode, #results .tnode').forEach(nd=>{
     const b = nd.querySelector(':scope > .trow > .destbtn');
     if(!b) return;
     const cur = (PLAN[nd.dataset.path]||{}).target||'';
@@ -3604,7 +3672,7 @@ function savePlan(){
 // an accent bar, everything that will be carried along by a planned ancestor
 // gets a lighter tint.
 function paintRows(){
-  document.querySelectorAll('#tree .tnode').forEach(nd=>{
+  document.querySelectorAll('#tree .tnode, #results .tnode').forEach(nd=>{
     const row = nd.querySelector(':scope > .trow');
     if(!row) return;
     const p = nd.dataset.path;
@@ -3636,6 +3704,154 @@ function drawPlan(){
 }
 function unplan(k){ delete PLAN[k]; drawPlan(); refreshTags(); redrawSelects(); }
 
+// ---- search ---------------------------------------------------------------
+// The filter box narrows what is on screen; Enter searches the whole Drive
+// by name. Results are real rows: you can plan a move, rename, delete or
+// jump to where the item lives.
+const RCACHE = [];
+async function runSearch(){
+  const term = (document.getElementById('filter').value||'').trim();
+  const box = document.getElementById('results');
+  const tree = document.getElementById('tree');
+  if(term.length < 2){
+    await uiAlert('Type at least two characters to search.',
+      {title:'Search'});
+    return;
+  }
+  if(VIEW!=='org') setView('org');
+  tree.style.display = 'none';
+  box.style.display = '';
+  box.innerHTML = '<div class=muted style="padding:8px">'+
+    '<span class=spin></span> searching your Drive for '+esc(term)+
+    '&hellip;</div>';
+  let d;
+  try{ d = await api('/api/search?q='+encodeURIComponent(term)); }
+  catch(e){
+    box.innerHTML = '<div class=warn style="padding:8px">'+
+      esc(niceErr(e))+'</div>';
+    return;
+  }
+  RCACHE.length = 0;
+  (d.items||[]).forEach(i=>RCACHE.push(i));
+  const head = '<div class=note style="margin:0 0 10px">'+
+    '<strong>'+d.total.toLocaleString()+' result'+
+    (d.total===1?'':'s')+'</strong> for '+esc(term)+
+    (d.capped?' — showing the first '+d.total.toLocaleString()+
+      ', narrow the search for more':'')+
+    (d.indexed?'':' <span class=muted>(paths appear once the folder '+
+      'index finishes)</span>')+
+    '<br><button class="btn ghost" style="margin-top:9px" '+
+    'onclick=closeSearch()>&larr; Back to the tree</button></div>';
+  box.innerHTML = head + (d.items.length
+    ? d.items.map(resultRow).join('')
+    : '<div class=muted style="padding:8px">Nothing matched.</div>');
+  paintRows();
+}
+function resultRow(n){
+  const planned = PLAN[n.path];
+  const stats = (n.files!=null ? n.files.toLocaleString()+' files' : '') +
+    (n.bytes ? ' · '+human(n.bytes) : '') +
+    (!n.folder && n.size ? human(n.size) : '');
+  return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
+    esc(n.id)+'" data-folder="'+(n.folder?1:0)+'" data-name="'+
+    esc(n.name)+'">'+
+    '<div class="trow'+(planned?' planned':'')+'" draggable=true '+
+    'ondragstart="dragStart(event,this)" ondragend="dragEnd(this)">'+
+    '<span class=tw></span><span class=ic>'+icon(n)+'</span>'+
+    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+
+    '<span class=hint style="margin-left:7px">'+
+    esc(n.parentPath||'My Drive')+'</span></span>'+
+    (n.shared?'<span class="tag stay">shared</span>':'')+
+    '<span class=mt>'+esc(stats)+'</span>'+
+    '<button class=rowx title="show where this lives" onclick="revealPath('+
+    '\''+esc(n.path).replace(/'/g,"\\'")+'\',true)">&#128269;</button>'+
+    '<button class=rowx title="rename" onclick="renameItem(\''+esc(n.id)+
+    '\',\''+esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
+    ',this)">&#9998;</button>'+
+    '<button class=rowx title="move to Drive trash" onclick="trashItem(\''+
+    esc(n.id)+'\',\''+esc(n.name).replace(/'/g,"\\'")+'\','+
+    (n.folder?1:0)+',this)">&#128465;</button>'+
+    destBtn(n.path, n.id, n.name, planned?planned.target:'')+
+    '</div></div>';
+}
+function closeSearch(){
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('results').innerHTML = '';
+  RCACHE.length = 0;
+  document.getElementById('tree').style.display =
+    VIEW==='org' ? '' : 'none';
+}
+
+// ---- drag and drop --------------------------------------------------------
+// Dragging a row onto a folder plans a move, exactly as choosing that
+// folder from the dropdown does. Nothing moves in Drive until Execute.
+let DRAG = null;
+function dragStart(ev, row){
+  const nd = row.closest('.tnode');
+  if(!nd) return;
+  DRAG = {path:nd.dataset.path, id:nd.dataset.id,
+          name:nd.dataset.name || (nd.dataset.path||'').split('/').pop(),
+          folder:nd.dataset.folder==='1'};
+  row.classList.add('dragging');
+  try{
+    ev.dataTransfer.effectAllowed = 'move';
+    ev.dataTransfer.setData('text/plain', DRAG.path);
+  }catch(e){}
+}
+function dragEnd(row){
+  row.classList.remove('dragging');
+  document.querySelectorAll('.dropok,.dropno').forEach(
+    el=>el.classList.remove('dropok','dropno'));
+  DRAG = null;
+}
+// Why a drop would be refused, or null when it is fine.
+function dropRefusal(destPath){
+  if(!DRAG) return 'nothing is being dragged';
+  if(DRAG.path === destPath) return 'that is the item itself';
+  if(DRAG.folder && destPath.indexOf(DRAG.path+'/')===0)
+    return 'a folder cannot move inside itself';
+  if(parentOf(DRAG.path) === destPath) return 'it is already here';
+  const anc = ancestorPlanned(DRAG.path);
+  if(anc) return '"'+anc+'" is already moving and would carry this along';
+  return null;
+}
+function dragOver(ev, row){
+  if(!DRAG) return;
+  const nd = row.closest('.tnode');
+  if(!nd || nd.dataset.folder!=='1') return;
+  const refusal = dropRefusal(nd.dataset.path);
+  ev.preventDefault();      // required for drop to fire at all
+  ev.dataTransfer.dropEffect = refusal ? 'none' : 'move';
+  row.classList.toggle('dropok', !refusal);
+  row.classList.toggle('dropno', !!refusal);
+  if(refusal) row.title = 'Cannot drop here — '+refusal;
+}
+function dragLeave(row){ row.classList.remove('dropok','dropno'); }
+async function dropOn(ev, row){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const nd = row.closest('.tnode');
+  row.classList.remove('dropok','dropno');
+  if(!nd || !DRAG) return;
+  const dest = nd.dataset.path;
+  const item = DRAG;              // dragEnd clears it once the drop settles
+  const refusal = dropRefusal(dest);
+  if(refusal){
+    await uiAlert('<b>'+esc(item.name)+'</b> cannot go into <b>'+
+      esc(dest)+'</b> — '+esc(refusal)+'.', {title:'Cannot drop here'});
+    return;
+  }
+  // Same funnel as the picker: guards, overlap handling, persistence.
+  await setDest(item.path, item.id, item.name, dest);
+  pushRecent(dest);
+  const target = findNode(item.path);
+  if(target){
+    const r = target.querySelector(':scope > .trow');
+    if(r){ r.classList.add('flash');
+      setTimeout(()=>r.classList.remove('flash'), 1200); }
+  }
+}
+
 // One click anywhere on a row: folders expand/collapse, files open a viewer.
 // Clicks on controls (selects, buttons, chips) keep their own behaviour.
 function rowToggle(row, ev){
@@ -3659,6 +3875,7 @@ function findItem(id){
   for(const k in SCACHE){
     const f = SCACHE[k].find(i=>i.id===id); if(f) return f; }
   const t = TCACHE.find(i=>i.id===id); if(t) return t;
+  const r = RCACHE.find(i=>i.id===id); if(r) return r;
   return null;
 }
 // Copy to clipboard. The page is served from 127.0.0.1, which browsers
@@ -3814,6 +4031,53 @@ async function loadText(url){
 // deleting in Drive itself does — recoverable for 30 days, then Drive
 // removes it permanently. The confirmation says so, and for a folder it
 // states how much goes with it, read live rather than from the last scan.
+// Rename in place. A rename changes the path of the item and everything
+// beneath it, so anything already planned under the old path is rewritten
+// and the tree is re-read afterwards.
+async function renameItem(fid, name, isFolder, btn){
+  const next = await uiPrompt(
+    'New name for '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b>:',
+    name, {title:'Rename', yes:'Rename'});
+  if(!next || next===name) return;
+  if(next.indexOf('/')>-1){
+    await uiAlert('A name cannot contain a slash — Drive would show it as '+
+      'part of the path.', {title:'Invalid name'});
+    return;
+  }
+  const undo = busy(btn);
+  try{
+    await api('/api/rename',{id:fid, name:next});
+  }catch(e){
+    undo();
+    uiAlert(esc(niceErr(e)), {title:'Could not rename'});
+    return;
+  }
+  // Planned moves refer to items by path; keep them pointing at the same
+  // things rather than silently losing the selection.
+  const nd = btn.closest('.tnode');
+  const oldPath = nd ? nd.dataset.path : '';
+  if(oldPath){
+    const parent = parentOf(oldPath);
+    const newPath = parent ? parent+'/'+next : next;
+    Object.keys(PLAN).forEach(k=>{
+      if(k===oldPath || k.indexOf(oldPath+'/')===0){
+        const moved = newPath + k.slice(oldPath.length);
+        PLAN[moved] = PLAN[k];
+        PLAN[moved].path = moved;
+        if(k===oldPath) PLAN[moved].name = next;
+        delete PLAN[k];
+      }
+    });
+    Object.values(PLAN).forEach(p=>{
+      if(p.target===oldPath || p.target.indexOf(oldPath+'/')===0)
+        p.target = newPath + p.target.slice(oldPath.length);
+    });
+    if(DISCOVERED.delete(oldPath)) DISCOVERED.add(newPath);
+    savePlan();
+  }
+  await refreshTree();
+  drawPlan();
+}
 // Session-only: a reload restores confirmations. Persisting this would let
 // someone come back days later and delete with no prompt, having forgotten
 // they ever turned it off.
@@ -3991,7 +4255,12 @@ function setView(v){
   ['org','share','trash'].forEach(t=>{
     document.getElementById('tab-'+t).classList.toggle('on', v===t);
   });
-  document.getElementById('tree').style.display = v==='org'?'':'none';
+  const res = document.getElementById('results');
+  const searching = v==='org' && res && res.style.display!=='none';
+  document.getElementById('tree').style.display =
+    (v==='org' && !searching)?'':'none';
+  if(res && v!=='org') res.style.display = 'none';
+  else if(res && v==='org' && res.innerHTML) res.style.display = '';
   document.getElementById('stree').style.display = v==='share'?'':'none';
   document.getElementById('ttree').style.display = v==='trash'?'':'none';
   document.getElementById('onlyshared').style.display =
@@ -4375,6 +4644,7 @@ async function expandNode(nd, path){
 // level, so an item planned three folders deep leaves no trace on screen.
 async function revealPath(path, flash){
   if(VIEW!=='org') setView('org');
+  closeSearch();          // the tree has to be on screen to reveal into it
   const parts = String(path||'').split('/').filter(Boolean);
   let acc = '';
   for(let i=0;i<parts.length-1;i++){
@@ -5100,7 +5370,7 @@ def run_ui(args) -> None:
                                     "paths": [], "known": set(), "count": 0,
                                     "at": "", "error": "", "expected": 0,
                                     "stale": False, "again": False,
-                                    "parents": {}}
+                                    "parents": {}, "idpath": {}}
     # Rolled-up file count and size per folder, computed live. The scan's
     # figures go stale the moment anything moves — after a reorganisation
     # most folders have no scan entry at all — so the tree cannot rely on
@@ -5261,9 +5531,11 @@ def run_ui(args) -> None:
                 token = resp.get("nextPageToken")
                 if not token:
                     break
-            paths = [p for p in (path_of(f) for f in by_id) if p]
-            paths.sort(key=str.lower)
+            resolved = {f: path_of(f) for f in by_id}
+            idpath = {f: p for f, p in resolved.items() if p}
+            paths = sorted(idpath.values(), key=str.lower)
             with findex_lock:
+                folder_index["idpath"] = idpath
                 folder_index.update(paths=paths, known=set(paths),
                                     count=len(paths), expected=len(paths),
                                     at=datetime.now().strftime("%H:%M"),
@@ -5550,6 +5822,12 @@ def run_ui(args) -> None:
                     locked(service.files().update(
                         fileId=rec["file_id"], body={"trashed": True}))
                     job.log.append(f"re-trashed  {rec.get('name', '')}")
+                elif rec.get("op") == "rename":
+                    locked(service.files().update(
+                        fileId=rec["file_id"],
+                        body={"name": rec.get("from", "")}))
+                    job.log.append(f"renamed back  {rec.get('to', '')}"
+                                   f"  ->  {rec.get('from', '')}")
                 elif rec.get("op") == "mkdir":
                     # A folder this run created — remove it again, but only
                     # if it is empty now.
@@ -5635,6 +5913,57 @@ def run_ui(args) -> None:
                 self.end_headers()
                 self.wfile.write(logo_bytes)
                 return
+            if u.path == "/api/search":
+                # Search the whole Drive by name, not just what is on
+                # screen. Paths come from the folder index, so a result
+                # says where it actually lives.
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                q = urllib.parse.parse_qs(u.query)
+                term = (q.get("q") or [""])[0].strip()
+                if len(term) < 2:
+                    self._send({"items": [], "total": 0,
+                                "error": "type at least two characters"})
+                    return
+                safe = term.replace("\\", "\\\\").replace("'", "\\'")
+                try:
+                    resp = locked(service.files().list(
+                        q=f"name contains '{safe}' and trashed = false",
+                        corpora="user",
+                        fields="files(id,name,mimeType,size,modifiedTime,"
+                               "parents,shared,webViewLink)",
+                        pageSize=SEARCH_LIMIT,
+                        orderBy="folder,name"))
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"}, 500)
+                    return
+                idpath = folder_index.get("idpath") or {}
+                hits = []
+                for f in resp.get("files", []):
+                    par = (f.get("parents") or [None])[0]
+                    folder = f.get("mimeType") == FOLDER_MIME
+                    where = idpath.get(par, "") if par != root_id else ""
+                    full = (where + "/" + f.get("name", "")) if where \
+                        else f.get("name", "")
+                    hits.append({
+                        "id": f["id"], "name": f.get("name", ""),
+                        "path": full, "parentPath": where,
+                        "folder": folder, "mime": f.get("mimeType", ""),
+                        "size": int(f.get("size") or 0) if not folder else 0,
+                        "files": (totals["files"].get(f["id"])
+                                  if folder and totals["ready"] else None),
+                        "bytes": (totals["bytes"].get(f["id"])
+                                  if folder and totals["ready"] else None),
+                        "live_totals": totals["ready"],
+                        "shared": bool(f.get("shared")),
+                        "link": f.get("webViewLink", ""),
+                        "modified": (f.get("modifiedTime") or "")[:10]})
+                self._send({"items": hits, "total": len(hits),
+                            "capped": len(hits) >= SEARCH_LIMIT,
+                            "indexed": bool(idpath)})
+                return
+
             if u.path == "/api/iteminfo":
                 # What deleting this would actually take with it, read live
                 # so the confirmation states real numbers rather than the
@@ -6091,6 +6420,48 @@ def run_ui(args) -> None:
                         "at": datetime.now().isoformat(
                             timespec="seconds")}) + "\n")
                 self._send({"ok": True})
+                return
+
+            if u.path == "/api/rename":
+                fid = (body.get("id") or "").strip()
+                new = (body.get("name") or "").strip()
+                if not fid or not new:
+                    self._send({"error": "missing id or name"}, 400)
+                    return
+                if "/" in new:
+                    # A slash would make the name look like a path in every
+                    # listing this tool produces, and break prefix logic.
+                    self._send({"error": "a name cannot contain '/'"}, 400)
+                    return
+                try:
+                    meta = locked(service.files().get(
+                        fileId=fid,
+                        fields="id,name,mimeType,capabilities(canRename)"))
+                    if (meta.get("capabilities") or {}).get(
+                            "canRename") is False:
+                        self._send({"error": "Drive will not let you rename "
+                                             "this — you may not own it"},
+                                   403)
+                        return
+                    old = meta.get("name", "")
+                    if old == new:
+                        self._send({"ok": True, "unchanged": True})
+                        return
+                    locked(service.files().update(
+                        fileId=fid, body={"name": new}))
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"}, 500)
+                    return
+                os.makedirs(LOG_DIR, exist_ok=True)
+                with open(os.path.join(LOG_DIR, "rename_actions.jsonl"),
+                          "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "op": "rename", "file_id": fid,
+                        "from": old, "to": new,
+                        "folder": meta.get("mimeType") == FOLDER_MIME,
+                        "at": datetime.now().isoformat(
+                            timespec="seconds")}) + "\n")
+                self._send({"ok": True, "old": old})
                 return
 
             if u.path == "/api/trashitem":

@@ -71,7 +71,12 @@ what you see is what's actually there — not a snapshot.
 
 - **Organise** — browse, assign destinations, preview, execute. Rows you've
   annotated are tinted; anything that will be carried along by a planned
-  parent is tinted lighter.
+  parent is tinted lighter. **Drag any row onto a folder** to plan a move —
+  it becomes a planned move exactly as choosing that folder from the
+  dropdown does, with impossible drops refused and the reason shown.
+  Rename anything in place, and **search your whole Drive by name**: press
+  Enter in the filter box and results come back as real rows you can plan,
+  rename, delete or jump to.
 - **Sharing** — an exposure audit. It opens by telling you what's actually
   at risk: **how many items are public on the web**, how many people and
   groups can reach your files, and who they are — ranked by how much each
