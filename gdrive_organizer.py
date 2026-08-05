@@ -2635,6 +2635,10 @@ color:var(--s1)}
 .cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
 padding:0 6px;font-size:11px;font-weight:700}
 /* Every close/remove control in the app: no button chrome, red intent. */
+.searchbox{position:relative;display:inline-flex;align-items:center}
+.searchbox input{width:230px;padding-right:26px}
+.searchbox .x{position:absolute;right:5px;font-size:15px;color:var(--muted)}
+.searchbox .x:hover{color:var(--crit);background:transparent}
 .noask{border-color:var(--crit);color:var(--crit);padding:5px 11px;
 line-height:1;flex:none}
 .noask:hover{background:rgba(208,59,59,.12);border-color:var(--crit)}
@@ -2709,11 +2713,16 @@ the same as deleting in Drive itself. Every change is logged and reversible.
         color:var(--ink2);white-space:nowrap">
         <input type=checkbox id=hideunshared onchange=filterTree()>
         only shared</label>
-      <input id=filter oninput=filterTree()
-        onkeydown="if(event.key==='Enter')runSearch()"
-        placeholder="filter visible — Enter to search all"
-        title="Type to filter what is on screen. Press Enter to search
-your whole Drive by name." style="width:230px">
+      <span class=searchbox>
+        <input id=filter oninput="filterTree();drawClear()"
+          onkeydown="if(event.key==='Enter')runSearch();
+                     if(event.key==='Escape')clearSearch()"
+          placeholder="filter visible — Enter to search all"
+          title="Type to filter what is on screen. Press Enter to search
+your whole Drive by name.">
+        <button id=clearsearch class=x style="display:none"
+          title="clear (Esc)" onclick=clearSearch()>&times;</button>
+      </span>
       <button class="btn ghost" onclick=runSearch()
         title="search your whole Drive">&#128269;</button>
       <button id=noask class="btn ghost noask" style="display:none"
@@ -3360,17 +3369,23 @@ async function pollIndex(){
         const tp = d.totals_expected
           ? Math.min(99, Math.round(d.totals_seen/d.totals_expected*100))
           : 0;
+        const seen = (d.totals_seen||0).toLocaleString();
+        const of = d.totals_expected
+          ? ' of about '+d.totals_expected.toLocaleString() : '';
         bar.style.display = '';
-        bar.innerHTML = '<strong>Counting folder contents.</strong> '+
-          'Folder sizes and file counts are being measured from your Drive '+
-          'as it is now — the figures from your last scan go out of date '+
-          'as soon as anything moves. '+
-          (d.totals_seen||0).toLocaleString()+
-          (d.totals_expected?' of about '+
-            d.totals_expected.toLocaleString():'')+' files read.'+
-          (d.totals_expected
-            ? '<div class=pbar style="margin-top:9px"><div class=pfill '+
-              'style="width:'+tp+'%"></div></div>' : '');
+        // Already-usable figures make this a background refresh, not
+        // something to wait for — so it gets a quiet line, not a banner.
+        bar.innerHTML = d.totals_usable
+          ? '<span class=muted><span class=spin></span> refreshing folder '+
+            'sizes in the background — '+seen+of+' files read. The figures '+
+            'on screen are usable meanwhile.</span>'
+          : '<strong>Counting folder contents.</strong> Folder sizes and '+
+            'file counts are being measured from your Drive as it is now, '+
+            'because figures from a scan go out of date as soon as '+
+            'anything moves. '+seen+of+' files read.'+
+            (d.totals_expected
+              ? '<div class=pbar style="margin-top:9px"><div class=pfill '+
+                'style="width:'+tp+'%"></div></div>' : '');
         await new Promise(r=>setTimeout(r,900));
         continue;
       }
@@ -3746,6 +3761,7 @@ async function runSearch(){
     ? d.items.map(resultRow).join('')
     : '<div class=muted style="padding:8px">Nothing matched.</div>');
   paintRows();
+  drawClear();
 }
 function resultRow(n){
   const planned = PLAN[n.path];
@@ -3780,6 +3796,24 @@ function closeSearch(){
   RCACHE.length = 0;
   document.getElementById('tree').style.display =
     VIEW==='org' ? '' : 'none';
+}
+// The x on the search box: empty the field, drop any result list, and put
+// the tree back the way it was before filtering.
+function clearSearch(){
+  const f = document.getElementById('filter');
+  f.value = '';
+  closeSearch();
+  filterTree();
+  drawClear();
+  f.focus();
+}
+function drawClear(){
+  const b = document.getElementById('clearsearch');
+  if(!b) return;
+  const f = document.getElementById('filter');
+  const res = document.getElementById('results');
+  b.style.display = (f.value || (res && res.style.display!=='none'))
+    ? '' : 'none';
 }
 
 // ---- drag and drop --------------------------------------------------------
@@ -5151,10 +5185,12 @@ def run_ui(args) -> None:
 
     # Optional: rolled-up totals from the last scan, purely informational.
     stats: Dict[str, Dict[str, Any]] = {}
+    scan_file_count = 0
     if os.path.exists(args.inventory):
         try:
             rows = load_inventory(args.inventory)
             files = [r for r in rows if not r["is_folder"]]
+            scan_file_count = len(files)
             files.sort(key=lambda r: r["path"])
             paths = [r["path"] for r in files]
             for r in rows:
@@ -5375,9 +5411,14 @@ def run_ui(args) -> None:
     # figures go stale the moment anything moves — after a reorganisation
     # most folders have no scan entry at all — so the tree cannot rely on
     # them for what it shows.
+    # `expected` seeds the progress bar. Without it the first pass shows a
+    # number climbing towards nothing, which reads as a hang rather than
+    # work in progress. The last scan's file count is a good enough
+    # estimate until a pass of our own has produced a real one.
     totals: Dict[str, Any] = {"ready": False, "building": False, "seen": 0,
                               "files": {}, "bytes": {}, "at": "",
-                              "error": "", "again": False, "expected": 0}
+                              "error": "", "again": False,
+                              "expected": scan_file_count, "stale": False}
     totals_lock = threading.Lock()
     findex_lock = threading.Lock()
     FINDEX_FILE = os.path.join(LOG_DIR, "folder_index.json")
@@ -5404,7 +5445,9 @@ def run_ui(args) -> None:
             tb = d.get("totals_bytes") or {}
             if tf:
                 totals.update(files=tf, bytes=tb, ready=True,
-                              at=d.get("at", ""))
+                              at=d.get("at", ""), stale=True,
+                              expected=d.get("totals_expected")
+                              or totals["expected"])
             print(f"  loaded {len(paths):,} folder paths and totals for "
                   f"{len(tf):,} folders from {FINDEX_FILE} "
                   f"(refreshing in the background)")
@@ -5419,7 +5462,8 @@ def run_ui(args) -> None:
                            "at": folder_index["at"],
                            "paths": folder_index["paths"],
                            "totals_files": totals["files"],
-                           "totals_bytes": totals["bytes"]}, fh)
+                           "totals_bytes": totals["bytes"],
+                           "totals_expected": totals["expected"]}, fh)
         except Exception:
             pass
 
@@ -5597,7 +5641,7 @@ def run_ui(args) -> None:
                     break
             with totals_lock:
                 totals.update(files=counts, bytes=sizes, ready=True,
-                              expected=totals["seen"],
+                              expected=totals["seen"], stale=False,
                               at=datetime.now().strftime("%H:%M"))
             save_folder_cache()
         except Exception as err:
@@ -5609,6 +5653,15 @@ def run_ui(args) -> None:
                 totals["again"] = False
             if owed:
                 threading.Thread(target=build_totals, daemon=True).start()
+
+    def schedule_reindex() -> None:
+        """Re-read folders and totals after something changed their shape.
+
+        Safe to call at any moment: the builders coalesce, so a request
+        landing mid-crawl is remembered and runs afterwards rather than
+        being dropped or starting a second pass.
+        """
+        threading.Thread(target=build_folder_index, daemon=True).start()
 
     def search_folders(q: str, limit: int = 60) -> List[str]:
         """Same token rules as the picker: every token must appear, and a
@@ -6186,6 +6239,9 @@ def run_ui(args) -> None:
                             "totals_building": totals["building"],
                             "totals_seen": totals["seen"],
                             "totals_expected": totals["expected"],
+                            "totals_usable": totals["ready"]
+                                             and not totals["building"]
+                                             or bool(totals["files"]),
                             "usable": len(folder_index["paths"]),
                             "expected": folder_index["expected"],
                             "stale": folder_index["stale"],
@@ -6419,6 +6475,7 @@ def run_ui(args) -> None:
                         "name": meta.get("name"),
                         "at": datetime.now().isoformat(
                             timespec="seconds")}) + "\n")
+                schedule_reindex()      # it is a real folder again
                 self._send({"ok": True})
                 return
 
@@ -6461,6 +6518,11 @@ def run_ui(args) -> None:
                         "folder": meta.get("mimeType") == FOLDER_MIME,
                         "at": datetime.now().isoformat(
                             timespec="seconds")}) + "\n")
+                # A rename changes this folder's path and every path
+                # beneath it. Without a re-index the old path stays in the
+                # destination list, and resolving it would CREATE a folder
+                # under the old name instead of finding this one.
+                schedule_reindex()
                 self._send({"ok": True, "old": old})
                 return
 
@@ -6497,6 +6559,9 @@ def run_ui(args) -> None:
                         "folder": meta.get("mimeType") == FOLDER_MIME,
                         "at": datetime.now().isoformat(
                             timespec="seconds")}) + "\n")
+                # A trashed folder must stop being offered as a
+                # destination, or resolving it would recreate it.
+                schedule_reindex()
                 self._send({"ok": True})
                 return
 
