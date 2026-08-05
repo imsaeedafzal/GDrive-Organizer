@@ -2607,7 +2607,7 @@ background:rgba(42,120,214,.14);color:var(--s1);white-space:nowrap}
 .pi{display:flex;gap:8px;align-items:center;padding:5px 0;
 border-bottom:1px solid var(--grid);font-size:13px}
 .pi .a{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
-white-space:nowrap}
+white-space:nowrap;font-size:13px}
 .pi .x{border:0;background:transparent;color:var(--muted);cursor:pointer;
 font-size:16px}
 .cats{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}
@@ -2620,6 +2620,13 @@ color:var(--s1)}
 .cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
 padding:0 6px;font-size:11px;font-weight:700}
 /* Every close/remove control in the app: no button chrome, red intent. */
+.deststyle{border:0;background:transparent;color:inherit;font:inherit;
+font-weight:650;cursor:pointer;padding:0;text-align:left;min-width:0;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deststyle:hover{text-decoration:underline}
+@keyframes flashrow{0%{background:rgba(250,178,25,.45)}
+100%{background:transparent}}
+.flash{animation:flashrow 1.8s ease-out}
 .x{border:0;background:transparent;color:var(--crit);cursor:pointer;
 font-size:16px;line-height:1;padding:0 3px;border-radius:5px}
 .x:hover{background:rgba(208,59,59,.14);color:var(--crit)}
@@ -2930,7 +2937,9 @@ function drawCats(){
     const n = planCount(c);
     // In use: highlighted, counted, and clearable with one click.
     const inner = n
-      ? '<span style="font-weight:650">'+esc(c)+'</span>'+
+      ? '<button class=deststyle title="show the '+n+' item'+
+        (n===1?'':'s')+' going here" onclick="revealDest(\''+
+        esc(c).replace(/'/g,"\\'")+'\')">'+esc(c)+'</button>'+
         '<span class=cnt>'+n+'</span>'+
         '<button class=x title="clear '+n+' selection'+(n===1?'':'s')+
         ' for this destination" onclick="clearDest(\''+
@@ -3574,10 +3583,12 @@ function drawPlan(){
     ? 'Execute '+keys.length+' move'+(keys.length===1?'':'s')
     : 'Execute';
   document.getElementById('pend').innerHTML = keys.length
-    ? keys.map(k=>'<div class=pi><span class=a title="'+esc(k)+'">'+
-        esc(k)+'</span><span class=tag>'+esc(PLAN[k].target)+'</span>'+
-        '<button class=x onclick="unplan(\''+esc(k).replace(/'/g,"\\'")+
-        '\')">&times;</button></div>').join('')
+    ? keys.map(k=>'<div class=pi><button class="a deststyle" title="show '+
+        'this in the tree" onclick="revealPath(\''+
+        esc(k).replace(/'/g,"\\'")+'\',true)">'+esc(k)+'</button>'+
+        '<span class=tag>'+esc(PLAN[k].target)+'</span>'+
+        '<button class=x title="remove this selection" onclick="unplan(\''+
+        esc(k).replace(/'/g,"\\'")+'\')">&times;</button></div>').join('')
     : '<div class=muted style="font-size:13px;padding:6px 0">Nothing planned '+
       'yet. Everything stays exactly where it is.</div>';
   savePlan(); paintRows(); drawCats();
@@ -4266,6 +4277,79 @@ function findNode(p){
   for(const nd of all){ if(nd.dataset.path===p) return nd; }
   return null;
 }
+// Open a node if it is not already open. tog() toggles, so calling it
+// blindly on an open folder would close it.
+async function expandNode(nd, path){
+  const holder = nd.querySelector(':scope > .kids');
+  const tw = nd.querySelector(':scope > .trow > .tw');
+  if(!holder || !tw) return;
+  if(holder.dataset.loaded && holder.style.display!=='none') return;
+  await tog(tw, nd.dataset.id, path);
+}
+// Walk the tree open from the root down to `path` and bring it into view.
+// Restored selections are otherwise invisible: the tree only loads its top
+// level, so an item planned three folders deep leaves no trace on screen.
+async function revealPath(path, flash){
+  if(VIEW!=='org') setView('org');
+  const parts = String(path||'').split('/').filter(Boolean);
+  let acc = '';
+  for(let i=0;i<parts.length-1;i++){
+    acc = acc ? acc+'/'+parts[i] : parts[i];
+    const nd = findNode(acc);
+    if(!nd) return null;         // moved or gone since it was planned
+    await expandNode(nd, acc);
+  }
+  const target = findNode(path);
+  if(target && flash!==false){
+    const row = target.querySelector(':scope > .trow');
+    if(row){
+      row.classList.add('flash');
+      setTimeout(()=>row.classList.remove('flash'), 1800);
+    }
+    target.scrollIntoView({block:'center', behavior:'smooth'});
+  }
+  return target;
+}
+// After a reload, open the tree to everything still waiting to be executed.
+async function revealPlanned(){
+  const paths = Object.keys(PLAN);
+  if(!paths.length) return;
+  const stat = document.getElementById('treestat');
+  if(stat) stat.innerHTML = '<span class=spin></span> opening your '+
+    'selections…';
+  const missing = [];
+  // Shallowest first, so parents are open before their children are needed.
+  paths.sort((a,b)=>a.split('/').length-b.split('/').length||(a<b?-1:1));
+  for(const p of paths){
+    const nd = await revealPath(p, false);
+    if(!nd) missing.push(p);
+  }
+  paintRows();
+  if(stat){
+    stat.textContent = missing.length
+      ? missing.length+' selected item'+(missing.length===1?'':'s')+
+        ' could not be found — '+(missing.length===1?'it has':'they have')+
+        ' moved or been removed'
+      : '';
+  }
+  if(missing.length){
+    // A plan pointing at something that no longer exists cannot execute,
+    // so say which, rather than failing later.
+    uiAlert('These selections point at items that are no longer where '+
+      'they were:<br><br><code>'+missing.map(esc).join('</code><br><code>')+
+      '</code><br><br><span class=muted>They were probably moved by an '+
+      'earlier run. Remove them from Planned moves and choose again.'+
+      '</span>', {title:'Some selections are stale'});
+  }
+}
+// Clicking a destination shows what you assigned to it.
+async function revealDest(c){
+  const hits = Object.keys(PLAN).filter(
+    k=>PLAN[k].target===c || PLAN[k].target.indexOf(c+'/')===0);
+  if(!hits.length) return;
+  for(const p of hits.slice(1)) await revealPath(p, false);
+  await revealPath(hits[0], true);
+}
 // Re-read the tree from Drive in place: root folders, destination list and
 // every folder you had expanded — without a page reload, keeping your spot.
 async function refreshTree(){
@@ -4612,6 +4696,10 @@ async function boot(){
   drawCats();
   document.getElementById('tree').innerHTML = items.map(rowHtml).join('');
   drawPlan();
+  // Selections survive a reload, so the tree has to show them. Without
+  // this, a plan restored from the browser is only visible in the side
+  // panel and the tree looks untouched.
+  await revealPlanned();
 }
 boot();
 </script></body></html>"""
