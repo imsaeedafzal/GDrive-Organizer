@@ -3167,7 +3167,12 @@ function rowHtml(n){
     (n.bytes? ' · '+human(n.bytes):'') +
     (!n.folder && n.size? human(n.size):'');
   const statTitle = (n.folder && n.files!=null)
-    ? ' title="rolled-up totals from your last scan"' : '';
+    ? (n.live_totals
+       ? ' title="everything inside this folder, counted from your Drive '+
+         'as it is now"'
+       : ' title="from your last scan — may be out of date if things have '+
+         'moved since"')
+    : '';
   return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
     esc(n.id)+'" data-folder="'+(n.folder?1:0)+'">'+
     '<div class="trow'+(planned?' planned':(anc?' carried':''))+
@@ -3242,7 +3247,7 @@ function scheduleRemote(){
 }
 // Index status on the page itself, from load: the first build takes a
 // while on a large Drive, and silently slow search is worse than a bar.
-let indexPolling = false;
+let indexPolling = false, TOTALS_SHOWN = false;
 async function pollIndex(){
   if(indexPolling) return;
   indexPolling = true;
@@ -3283,8 +3288,28 @@ async function pollIndex(){
           'destination path by hand.</span>';
         return;
       }
+      if(d.totals_building){
+        const tp = d.totals_expected
+          ? Math.min(99, Math.round(d.totals_seen/d.totals_expected*100))
+          : 0;
+        bar.style.display = '';
+        bar.innerHTML = '<strong>Counting folder contents.</strong> '+
+          'Folder sizes and file counts are being measured from your Drive '+
+          'as it is now — the figures from your last scan go out of date '+
+          'as soon as anything moves. '+
+          (d.totals_seen||0).toLocaleString()+
+          (d.totals_expected?' of about '+
+            d.totals_expected.toLocaleString():'')+' files read.'+
+          (d.totals_expected
+            ? '<div class=pbar style="margin-top:9px"><div class=pfill '+
+              'style="width:'+tp+'%"></div></div>' : '');
+        await new Promise(r=>setTimeout(r,900));
+        continue;
+      }
       bar.style.display = 'none';
       if(PICK) drawPicker();
+      // Totals just landed: show them without disturbing the view.
+      if(d.totals_ready && !TOTALS_SHOWN){ TOTALS_SHOWN = true; refreshTree(); }
       return;
     }
   } finally { indexPolling = false; }
@@ -5074,7 +5099,16 @@ def run_ui(args) -> None:
     folder_index: Dict[str, Any] = {"ready": False, "building": False,
                                     "paths": [], "known": set(), "count": 0,
                                     "at": "", "error": "", "expected": 0,
-                                    "stale": False, "again": False}
+                                    "stale": False, "again": False,
+                                    "parents": {}}
+    # Rolled-up file count and size per folder, computed live. The scan's
+    # figures go stale the moment anything moves — after a reorganisation
+    # most folders have no scan entry at all — so the tree cannot rely on
+    # them for what it shows.
+    totals: Dict[str, Any] = {"ready": False, "building": False, "seen": 0,
+                              "files": {}, "bytes": {}, "at": "",
+                              "error": "", "again": False, "expected": 0}
+    totals_lock = threading.Lock()
     findex_lock = threading.Lock()
     FINDEX_FILE = os.path.join(LOG_DIR, "folder_index.json")
 
@@ -5096,8 +5130,14 @@ def run_ui(args) -> None:
                                 count=len(paths), expected=len(paths),
                                 at=d.get("at", ""), ready=bool(paths),
                                 stale=True)
-            print(f"  loaded {len(paths):,} folder paths from "
-                  f"{FINDEX_FILE} (refreshing in the background)")
+            tf = d.get("totals_files") or {}
+            tb = d.get("totals_bytes") or {}
+            if tf:
+                totals.update(files=tf, bytes=tb, ready=True,
+                              at=d.get("at", ""))
+            print(f"  loaded {len(paths):,} folder paths and totals for "
+                  f"{len(tf):,} folders from {FINDEX_FILE} "
+                  f"(refreshing in the background)")
         except Exception as err:
             print(f"  (could not read {FINDEX_FILE}: {err})")
 
@@ -5107,7 +5147,9 @@ def run_ui(args) -> None:
             with open(FINDEX_FILE, "w", encoding="utf-8") as fh:
                 json.dump({"root": root_id,
                            "at": folder_index["at"],
-                           "paths": folder_index["paths"]}, fh)
+                           "paths": folder_index["paths"],
+                           "totals_files": totals["files"],
+                           "totals_bytes": totals["bytes"]}, fh)
         except Exception:
             pass
 
@@ -5225,8 +5267,13 @@ def run_ui(args) -> None:
                 folder_index.update(paths=paths, known=set(paths),
                                     count=len(paths), expected=len(paths),
                                     at=datetime.now().strftime("%H:%M"),
-                                    ready=True, stale=False)
+                                    ready=True, stale=False,
+                                    # Kept so folder totals can roll a
+                                    # file's size up through its ancestors.
+                                    parents={k: v[1]
+                                             for k, v in by_id.items()})
             save_folder_cache()
+            threading.Thread(target=build_totals, daemon=True).start()
         except Exception as err:
             folder_index["error"] = f"{type(err).__name__}: {err}"
         finally:
@@ -5237,6 +5284,59 @@ def run_ui(args) -> None:
             if owed:
                 threading.Thread(target=build_folder_index,
                                  daemon=True).start()
+
+    def build_totals() -> None:
+        """Roll every file's size and count up through its ancestors.
+
+        One pass over files only, using the parent map the folder index
+        already built. Coalesced like the index: a request arriving mid-run
+        is remembered rather than dropped, so totals cannot be left
+        describing a Drive from before the last move.
+        """
+        with totals_lock:
+            if totals["building"]:
+                totals["again"] = True
+                return
+            totals.update(building=True, error="", again=False, seen=0)
+        try:
+            fmap = folder_index.get("parents") or {}
+            counts: Dict[str, int] = {}
+            sizes: Dict[str, int] = {}
+            token = None
+            while True:
+                resp = locked(service.files().list(
+                    q=f"mimeType != '{FOLDER_MIME}' and trashed = false",
+                    corpora="user",
+                    fields="nextPageToken, files(id,parents,size)",
+                    pageSize=1000, pageToken=token))
+                batch = resp.get("files", [])
+                totals["seen"] += len(batch)
+                for f in batch:
+                    sz = int(f.get("size") or 0)
+                    cur = (f.get("parents") or [None])[0]
+                    hops = 0
+                    while cur and hops < 200:
+                        counts[cur] = counts.get(cur, 0) + 1
+                        sizes[cur] = sizes.get(cur, 0) + sz
+                        cur = fmap.get(cur)
+                        hops += 1
+                token = resp.get("nextPageToken")
+                if not token:
+                    break
+            with totals_lock:
+                totals.update(files=counts, bytes=sizes, ready=True,
+                              expected=totals["seen"],
+                              at=datetime.now().strftime("%H:%M"))
+            save_folder_cache()
+        except Exception as err:
+            totals["error"] = f"{type(err).__name__}: {err}"
+        finally:
+            with totals_lock:
+                totals["building"] = False
+                owed = totals.get("again", False)
+                totals["again"] = False
+            if owed:
+                threading.Thread(target=build_totals, daemon=True).start()
 
     def search_folders(q: str, limit: int = 60) -> List[str]:
         """Same token rules as the picker: every token must appear, and a
@@ -5689,6 +5789,16 @@ def run_ui(args) -> None:
                     st = stats.get(k["id"], {})
                     own = (k.get("owners") or [{}])[0].get(
                         "emailAddress", "")
+                    # Live totals win over the scan's, which go stale as
+                    # soon as anything moves.
+                    if folder and totals["ready"]:
+                        n_files = totals["files"].get(k["id"], 0)
+                        n_bytes = totals["bytes"].get(k["id"], 0)
+                        live = True
+                    else:
+                        n_files = st.get("files")
+                        n_bytes = st.get("bytes")
+                        live = False
                     item = {
                         "id": k["id"], "name": k.get("name", ""),
                         "path": (parent_path + "/" + k.get("name", ""))
@@ -5696,8 +5806,9 @@ def run_ui(args) -> None:
                         "folder": folder,
                         "mime": k.get("mimeType", ""),
                         "size": int(k.get("size") or 0) if not folder else 0,
-                        "files": st.get("files") if folder else None,
-                        "bytes": st.get("bytes") if folder else None,
+                        "files": n_files if folder else None,
+                        "bytes": n_bytes if folder else None,
+                        "live_totals": live,
                         "owned": (not me) or own == me,
                         "shared": bool(k.get("shared")),
                         # Only the owner can change who a file is shared
@@ -5742,6 +5853,10 @@ def run_ui(args) -> None:
                 self._send({"ready": folder_index["ready"],
                             "building": folder_index["building"],
                             "count": folder_index["count"],
+                            "totals_ready": totals["ready"],
+                            "totals_building": totals["building"],
+                            "totals_seen": totals["seen"],
+                            "totals_expected": totals["expected"],
                             "usable": len(folder_index["paths"]),
                             "expected": folder_index["expected"],
                             "stale": folder_index["stale"],

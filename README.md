@@ -259,9 +259,10 @@ The things worth knowing before you trust it with 190,000 files:
 ## Limitations
 
 - **My Drive only.** Shared drives aren't supported.
-- **The scan is a snapshot.** Folder totals shown in the live UI come from
-  your last `scan`; emptiness and contents are read live, and the live
-  answer wins where they disagree.
+- **The scan is a snapshot**, but the live UI no longer depends on it:
+  folder totals, emptiness and contents are all measured from your Drive as
+  it is now. The scan's figures are used only as a stand-in until the live
+  count finishes, and the tooltip says which you're looking at.
 - **Duplicate detection needs content hashes.** Google-native files (Docs,
   Sheets, Slides) don't have them and are never treated as duplicates.
 - **Some files can't be typed by anyone.** Drive reports no MIME and the
