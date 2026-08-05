@@ -2495,7 +2495,7 @@ html,body{overflow-x:hidden}
 @media(max-width:940px){.app{grid-template-columns:1fr}}
 .app>*{min-width:0}
 #tree{transition:opacity .25s}
-#tree.updating{opacity:.45;pointer-events:none}
+#tree.updating{opacity:.45;pointer-events:none;cursor:progress}
 .panel{background:var(--surface);border:1px solid var(--ring);
 border-radius:12px;padding:14px;min-width:0;overflow:hidden}
 .tree{font-size:14px}
@@ -4406,31 +4406,65 @@ async function revealDest(c){
 }
 // Re-read the tree from Drive in place: root folders, destination list and
 // every folder you had expanded — without a page reload, keeping your spot.
+function findIn(container, path){
+  const all = container.querySelectorAll('.tnode');
+  for(const nd of all){ if(nd.dataset.path===path) return nd; }
+  return null;
+}
+// Assemble a complete tree into a detached container: root first, then
+// every folder that was open, parents before children.
+async function buildTreeInto(container, openPaths){
+  const items = await children('root','');
+  ROOT_FOLDERS = items.filter(i=>i.folder).map(i=>i.name);
+  container.innerHTML = items.map(rowHtml).join('');
+  const paths = openPaths.slice().sort((a,b)=>
+    a.split('/').length - b.split('/').length || (a<b?-1:1));
+  const reopened = {};
+  for(const p of paths){
+    const nd = findIn(container, p);
+    // A folder that moved away is simply not found — that is the update
+    // working, not an error.
+    if(!nd || !nd.dataset.id) continue;
+    const holder = nd.querySelector(':scope > .kids');
+    const tw = nd.querySelector(':scope > .trow > .tw');
+    if(!holder || !tw) continue;
+    let kids;
+    try{ kids = await children(nd.dataset.id, p); }
+    catch(e){ continue; }
+    holder.innerHTML = kids.length
+      ? kids.map(rowHtml).join('')
+      : '<div class=muted style="padding:5px 6px;font-size:13px">empty</div>';
+    holder.dataset.loaded = '1';
+    holder.style.display = '';
+    tw.innerHTML = '&#9662;';
+    reopened[p] = nd.dataset.id;
+  }
+  return reopened;
+}
+// Re-read the tree without it visibly collapsing. The old tree stays on
+// screen, dimmed and inert, while the new one is built off-screen; the
+// swap is then a single frame, and the scroll position is kept.
 async function refreshTree(){
   if(refreshing){ refreshQueued = true; return; }
   refreshing = true;
   const tree = document.getElementById('tree');
   const stat = document.getElementById('treestat');
   tree.classList.add('updating');
-  if(stat) stat.textContent = 'updating from Drive…';
+  if(stat) stat.innerHTML = '<span class=spin></span> updating from '+
+    'Drive&hellip;';
   const open = Object.assign({}, OPENSET);
-  Object.keys(OPENSET).forEach(k=>delete OPENSET[k]);
   try{
     for(const k in CACHE) delete CACHE[k];
-    const items = await children('root','');
-    ROOT_FOLDERS = items.filter(i=>i.folder).map(i=>i.name);
+    const staging = document.createElement('div');
+    const reopened = await buildTreeInto(staging, Object.keys(open));
     rebuildCats(); drawCats();
-    tree.innerHTML = items.map(rowHtml).join('');
-    // Re-expand what was open, parents before children. A folder that moved
-    // away simply is not found any more — that is the update working.
-    const paths = Object.keys(open).sort((a,b)=>
-      a.split('/').length - b.split('/').length || (a<b?-1:1));
-    for(const p of paths){
-      const nd = findNode(p);
-      if(!nd || !nd.dataset.id) continue;
-      const tw = nd.querySelector(':scope > .trow > .tw');
-      if(tw) await tog(tw, nd.dataset.id, p);
-    }
+    // One swap, after everything is ready.
+    const y = window.scrollY, inner = tree.scrollTop;
+    tree.innerHTML = staging.innerHTML;
+    tree.scrollTop = inner;
+    window.scrollTo(0, y);
+    Object.keys(OPENSET).forEach(k=>delete OPENSET[k]);
+    Object.keys(reopened).forEach(p=>{ OPENSET[p] = reopened[p]; });
     drawPlan(); filterTree();
     // Moves change paths and can change what is shared where — the sharing
     // view re-reads on its next visit (or right now if it is on screen).
@@ -4439,7 +4473,9 @@ async function refreshTree(){
     if(st){ st.dataset.loaded=''; if(VIEW==='share') bootShare(); }
     if(stat) stat.textContent = '';
   }catch(e){
-    if(stat) stat.textContent = 'could not update: '+e;
+    // The old tree is still on screen and still correct enough to use —
+    // nothing was torn down, so say what happened and leave it alone.
+    if(stat) stat.textContent = 'could not update: '+niceErr(e);
   }finally{
     tree.classList.remove('updating');
     refreshing = false;
