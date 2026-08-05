@@ -4837,6 +4837,25 @@ async function execute(){
   finally{ done(); }
   const ov=document.getElementById('ov'), box=document.getElementById('ovbox');
   const cl = d.clashes || [];
+  const col = d.collisions || [];
+  // Two of your own selections landing on the same name in the same
+  // folder. Drive allows it, so this has to be caught here or you get two
+  // same-named folders with full subtrees and no way to tell them apart.
+  const colBlock = col.length
+    ? '<div class=card style="border-color:var(--crit)">'+
+      '<strong style="color:var(--crit)">'+col.length+
+      ' name'+(col.length===1?'':'s')+' would end up twice in the same '+
+      'folder</strong>'+
+      '<div class=muted style="margin:6px 0 9px">These are items you '+
+      'selected, not something already there. Drive permits two folders '+
+      'with one name, so they would sit side by side and be impossible to '+
+      'tell apart. Rename one first, or send them to different '+
+      'folders.</div>'+
+      col.map(c=>'<div class=plog style="max-height:120px;margin:6px 0">'+
+        c.paths.map(esc).join('\n')+'\n   →  '+
+        esc(c.target+'/'+c.name)+'</div>').join('')+
+      '</div>'
+    : '';
   // Name clashes: Drive happily keeps two items with the same name in one
   // folder, so this must be an explicit decision rather than a silent one.
   const clashBlock = cl.length
@@ -4862,6 +4881,7 @@ async function execute(){
     ' move'+(d.ops.length===1?'':'s')+'</h2>'+
     (d.warnings.length?'<div class=warn>'+d.warnings.map(esc).join('<br>')+
       '</div>':'')+
+    colBlock+
     clashBlock+
     '<p class=muted>New folders: '+(d.creates.length?
       d.creates.map(esc).join(', '):'none')+'</p>'+
@@ -4870,8 +4890,11 @@ async function execute(){
     '<p class=muted style="margin-top:14px">No file is deleted. An undo log '+
     'is written before the first change.</p>'+
     '<div style="display:flex;gap:9px;margin-top:6px">'+
-    '<button class=btn id=runbtn onclick="run(this)">Run these '+
-      d.ops.length+' move'+(d.ops.length===1?'':'s')+'</button>'+
+    '<button class="btn'+(col.length?' danger':'')+'" id=runbtn '+
+      'onclick="run(this)">'+
+      (col.length?'Run anyway — accept the duplicate name'
+                 :'Run these '+d.ops.length+' move'+
+                  (d.ops.length===1?'':'s'))+'</button>'+
     '<button class="btn ghost" onclick=closeOv()>Cancel</button></div>';
   ov.classList.add('on');
 }
@@ -5753,6 +5776,7 @@ def run_ui(args) -> None:
         job.undo_log = os.path.abspath(
             os.path.join(LOG_DIR, f"ui_{stamp}.jsonl"))
         folders: Optional[Folders] = None
+        moved_ids: Set[str] = set()
         try:
             with open(job.undo_log, "w", encoding="utf-8") as log:
                 def log_mkdir(pth: str, fid: str) -> None:
@@ -5784,6 +5808,15 @@ def run_ui(args) -> None:
                         if on_conflict == "replace":
                             ex = find_clash(tgt, item.get("name") or "",
                                             item["id"])
+                            # Never trash something this same run just
+                            # moved in. Two selections sharing a name would
+                            # otherwise have the second delete the first,
+                            # so the run would undo its own work.
+                            if ex and ex["id"] in moved_ids:
+                                job.log.append(
+                                    f"kept  {tgt}/{ex['name']}  — moved by "
+                                    f"this run, not replaced")
+                                ex = None
                             if ex:
                                 locked(service.files().update(
                                     fileId=ex["id"],
@@ -5812,6 +5845,7 @@ def run_ui(args) -> None:
                                 "old_parents": old,
                                 "from": pth, "to": tgt}) + "\n")
                             log.flush()
+                            moved_ids.add(item["id"])
                             job.log.append(f"moved  {pth}  ->  {tgt}")
                     except HttpError as err:
                         hint = ""
@@ -6413,12 +6447,28 @@ def run_ui(args) -> None:
                             "target": it.get("target") or "",
                             "name": it.get("name") or "",
                             "existing": ex})
+                # Two planned items with the same name heading for the same
+                # folder collide with EACH OTHER, which no check against
+                # what is already there can see — and if the destination is
+                # being created by this very run, there is nothing there to
+                # check against at all. Drive accepts both and you end up
+                # with two same-named folders, each with a full subtree.
+                groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = \
+                    defaultdict(list)
+                for it in plan:
+                    groups[((it.get("target") or ""),
+                            (it.get("name") or "").lower())].append(it)
+                collisions = [
+                    {"target": t, "name": g[0].get("name") or "",
+                     "paths": [x.get("path") or "" for x in g]}
+                    for (t, _n), g in groups.items() if len(g) > 1]
                 ops = [{"from": it["path"],
                         "to": it["target"] + "/" + it["name"]}
                        for it in plan]
                 self._send({"ops": ops,
                             "creates": sorted({it["target"] for it in plan}),
                             "clashes": clashes,
+                            "collisions": collisions,
                             "warnings": sorted(set(warnings))})
                 return
 
