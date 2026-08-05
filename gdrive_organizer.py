@@ -2620,6 +2620,10 @@ color:var(--s1)}
 .cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
 padding:0 6px;font-size:11px;font-weight:700}
 /* Every close/remove control in the app: no button chrome, red intent. */
+.cfmchk{display:flex;align-items:center;gap:8px;margin-top:16px;
+padding-top:13px;border-top:1px solid var(--grid);font-size:13px;
+color:var(--ink2);cursor:pointer}
+.cfmchk input{width:15px;height:15px}
 .deststyle{border:0;background:transparent;color:inherit;font:inherit;
 font-weight:650;cursor:pointer;padding:0;text-align:left;min-width:0;
 overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2682,7 +2686,9 @@ the same as deleting in Drive itself. Every change is logged and reversible.
     </div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
       <strong>My Drive</strong>
-      <span id=treestat class=muted style="font-size:12px;flex:1"></span>
+      <span id=treestat class=muted style="font-size:12px"></span>
+      <span id=noask class=muted
+        style="font-size:12px;flex:1;color:var(--crit)"></span>
       <label id=onlyshared style="display:none;font-size:12.5px;
         color:var(--ink2);white-space:nowrap">
         <input type=checkbox id=hideunshared onchange=filterTree()>
@@ -2799,13 +2805,18 @@ async function api(p,body){
 
 // Branded yes/no dialog in the page's own stylesheet — no native popups.
 // `msg` is HTML; callers esc() anything user-controlled they interpolate.
+// Set by the last uiConfirm that offered a checkbox, read straight after.
+let CONFIRM_CHECKED = false;
 function uiConfirm(msg, opts){
   opts = opts || {};
   return new Promise(res=>{
     const ov = document.getElementById('cfm');
     document.getElementById('cfm-title').textContent =
       opts.title || 'Please confirm';
-    document.getElementById('cfm-msg').innerHTML = msg;
+    document.getElementById('cfm-msg').innerHTML = msg +
+      (opts.checkbox
+        ? '<label class=cfmchk><input type=checkbox id=cfm-chk> '+
+          opts.checkbox+'</label>' : '');
     const yes = document.getElementById('cfm-yes');
     const no = document.getElementById('cfm-no');
     yes.textContent = opts.yes || 'Yes';
@@ -2813,6 +2824,8 @@ function uiConfirm(msg, opts){
     no.style.display = '';          // a previous uiAlert may have hidden it
     yes.className = 'btn' + (opts.danger ? ' danger' : '');
     function done(v){
+      const chk = document.getElementById('cfm-chk');
+      CONFIRM_CHECKED = !!(chk && chk.checked);
       ov.classList.remove('on');
       yes.onclick = no.onclick = null;
       ov.onkeydown = null;
@@ -3773,6 +3786,20 @@ async function loadText(url){
 // deleting in Drive itself does — recoverable for 30 days, then Drive
 // removes it permanently. The confirmation says so, and for a folder it
 // states how much goes with it, read live rather than from the last scan.
+// Session-only: a reload restores confirmations. Persisting this would let
+// someone come back days later and delete with no prompt, having forgotten
+// they ever turned it off.
+let TRASH_NOASK = false;
+let TRASHED_COUNT = 0;
+function drawNoAsk(){
+  const el = document.getElementById('noask');
+  if(!el) return;
+  el.innerHTML = TRASH_NOASK
+    ? 'delete confirmations off '+
+      '<button class="btn ghost" style="padding:1px 8px;font-size:11.5px" '+
+      'onclick="TRASH_NOASK=false;drawNoAsk()">turn back on</button>'
+    : '';
+}
 async function trashItem(fid, name, isFolder, btn){
   const undoBtn = busy(btn);
   let info = null;
@@ -3801,16 +3828,30 @@ async function trashItem(fid, name, isFolder, btn){
   } else if(info && info.size){
     inside = ' <span class=muted>('+human(info.size)+')</span>';
   }
-  const ok = await uiConfirm(
-    'Move '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b> to the '+
-    'Drive trash?'+inside+
-    '<br><br><span class=muted>This is the same as deleting it in Drive: '+
-    'it stays in the trash for 30 days and can be restored at any time '+
-    'from the Trash tab, after which Drive deletes it permanently. The '+
-    'action is recorded in logs/trash_actions.jsonl, so '+
-    '<code>undo</code> can bring it back too.</span>',
-    {title:'Move to trash', yes:'Move to trash', danger:true});
-  if(!ok) return;
+  // A folder with things in it hides its own blast radius, so it always
+  // asks. "Don't ask again" covers files and empty folders, where what you
+  // are deleting is exactly what you clicked.
+  const hidesContents = isFolder && info && info.direct > 0;
+  if(!TRASH_NOASK || hidesContents){
+    const ok = await uiConfirm(
+      'Move '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b> to the '+
+      'Drive trash?'+inside+
+      '<br><br><span class=muted>This is the same as deleting it in '+
+      'Drive: it stays in the trash for 30 days and can be restored at '+
+      'any time from the Trash tab, after which Drive deletes it '+
+      'permanently. The action is recorded in logs/trash_actions.jsonl, '+
+      'so <code>undo</code> can bring it back too.</span>',
+      {title:'Move to trash', yes:'Move to trash', danger:true,
+       checkbox: hidesContents
+         ? null
+         : 'Do not ask again for the rest of this session — folders with '+
+           'contents will still ask'});
+    if(!ok) return;
+    if(CONFIRM_CHECKED && !hidesContents){
+      TRASH_NOASK = true;
+      drawNoAsk();
+    }
+  }
   const undo = busy(btn);
   try{
     await api('/api/trashitem',{id:fid});
@@ -3828,6 +3869,19 @@ async function trashItem(fid, name, isFolder, btn){
     Object.keys(SCACHE).forEach(k=>{
       SCACHE[k] = SCACHE[k].filter(i=>i.id!==fid); });
     delete CACHE[fid];
+    // With confirmations off the dialog is no longer the feedback, so say
+    // what happened where the tree can be seen.
+    TRASHED_COUNT++;
+    const stat = document.getElementById('treestat');
+    if(stat){
+      stat.textContent = TRASHED_COUNT+' item'+
+        (TRASHED_COUNT===1?'':'s')+' moved to trash';
+      clearTimeout(window._trashMsg);
+      window._trashMsg = setTimeout(()=>{
+        if(stat.textContent.indexOf('moved to trash')>-1)
+          stat.textContent = '';
+      }, 4000);
+    }
     // A deleted folder is no longer a place anything can be filed into.
     if(gone){
       let changed = DISCOVERED.delete(gone);
