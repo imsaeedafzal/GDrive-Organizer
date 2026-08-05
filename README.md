@@ -23,8 +23,8 @@ The strongest things it can do are:
 | Action | Reversible by | Notes |
 | --- | --- | --- |
 | Move a file or folder | `undo <log>` | The only action `apply` performs |
-| Trash a **verifiably empty** folder | `undo`, or Drive's trash | Emptiness re-checked server-side at the moment you click |
-| Trash a duplicate you confirmed | `undo`, or Drive's trash | One explicit click per item, in `review` |
+| Send a file or folder to the trash | Trash tab, or `undo` | Same as deleting in Drive: kept 30 days, restorable the whole time |
+| Trash a duplicate you confirmed | Trash tab, or `undo` | One explicit click per item, in `review` |
 | Remove one sharing permission | `undo` (it's re-created) | Records who lost access, so it can be restored |
 
 Everything else is read-only. Every run writes a JSON-lines undo log before
@@ -81,6 +81,11 @@ what you see is what's actually there — not a snapshot.
   clicking blindly.
 - **Trash** — view and restore. Deliberately **no** empty-trash or
   permanent-delete capability.
+
+Any row can be sent to the trash from the tree. The confirmation tells you
+what it costs before you agree: for a folder, how many items go with it,
+counted live rather than from the last scan — and that Drive keeps it for
+30 days, restorable the whole time, before removing it itself.
 
 Files carry an icon for their actual type — images, video, audio, PDFs,
 Docs/Sheets/Slides, archives, code, fonts, keys, databases — resolved from

@@ -5,21 +5,20 @@ reorganisation.
 
 WHAT THIS TOOL WILL NOT DO
 --------------------------
-It has no permanent-delete capability. The strongest action available is:
+It has no permanent-delete capability. Everything it can do is reversible:
   * moving a file or folder,
-  * on an explicit click in `review`, moving it to Drive's trash, which is
-    recoverable for 30 days,
+  * on an explicit click, moving a file or folder to Drive's trash —
+    exactly what deleting in Drive does. Trashed items stay for 30 days
+    and can be restored from the ui's Trash tab or by undoing
+    logs/trash_actions.jsonl; after 30 days Drive removes them itself,
   * on an explicit click in the ui's Sharing tab, removing one sharing
     permission (who it was is recorded in logs/share_actions.jsonl, and
-    `undo logs/share_actions.jsonl --execute` restores it),
-  * on an explicit click in the ui, trashing a folder that is verifiably
-    empty at that moment (recorded in logs/folder_actions.jsonl; also
-    restorable via undo), or
+    `undo logs/share_actions.jsonl --execute` restores it), or
   * during `undo`, trashing a folder that the run itself created and that
     is now empty.
-Nothing is ever destroyed, and nothing writes without --execute. The ui's
-Trash tab is strictly read-only plus restore — it cannot empty the trash or
-permanently delete anything. All generated logs and manifests live in logs/.
+Nothing is destroyed by this tool, and nothing writes without --execute.
+The ui's Trash tab is view-and-restore only — it cannot empty the trash or
+delete permanently. All generated logs and manifests live in logs/.
 
 WORKFLOW
 --------
@@ -2265,9 +2264,9 @@ gdrive_organizer — scan, propose, apply, review.
   undo        reverse any apply or quarantine run
 
 Nothing is ever permanently deleted. The strongest actions available are a
-move, trashing a folder that is verifiably empty, and removing one sharing
-permission — each on an explicit click, each logged, each reversible with
-`undo`. Drive's trash is recoverable for 30 days.
+move, moving an item to Drive's trash, and removing one sharing permission
+— each on an explicit click, each logged, each reversible with `undo`.
+Drive keeps trashed items for 30 days before removing them itself.
 
 All generated files (undo logs, manifests, the folder index) live in logs/.
 """
@@ -2620,8 +2619,11 @@ padding:1px 2px;font-size:13px}
 color:var(--s1)}
 .cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
 padding:0 6px;font-size:11px;font-weight:700}
-.cat.inuse .x{color:var(--s1)}
-.cat.inuse .x:hover{color:var(--crit)}
+/* Every close/remove control in the app: no button chrome, red intent. */
+.x{border:0;background:transparent;color:var(--crit);cursor:pointer;
+font-size:16px;line-height:1;padding:0 3px;border-radius:5px}
+.x:hover{background:rgba(208,59,59,.14);color:var(--crit)}
+.cat.inuse .x{color:var(--crit)}
 .cat.person{cursor:pointer;font:inherit;font-size:13px;color:var(--ink);
 gap:7px}
 .cat.person:hover{border-color:var(--s1);background:var(--grid)}
@@ -2653,9 +2655,10 @@ overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:10px}
 <p class=sub id=sub>Reading your Drive live. Expand a folder, choose where it
 should go, then execute.</p>
 
-<div class=note><strong>Nothing here can delete any file.</strong> This page
-creates folders, moves items, and — only on an explicit click in the Sharing
-tab — removes a sharing permission. Every change is logged and reversible.
+<div class=note><strong>Nothing here is deleted permanently.</strong> This
+page creates folders and moves items. Deleting sends something to Drive's
+trash, where it stays for 30 days and can be restored from the Trash tab —
+the same as deleting in Drive itself. Every change is logged and reversible.
 </div>
 
 <div id=indexbar class=note style="display:none"></div>
@@ -2935,8 +2938,8 @@ function drawCats(){
       : (isNew
         ? '<input value="'+esc(c)+'" onchange="renameCat(\''+esc(c)+
           '\',this.value)">'+
-          '<button class=x style="border:0;background:transparent;'+
-          'color:var(--muted);cursor:pointer" onclick="delCat(\''+esc(c)+
+          '<button class=x title="remove this destination — it does not '+
+          'exist in your Drive yet" onclick="delCat(\''+esc(c)+
           '\')">&times;</button>'
         : '<span style="font-weight:600">'+esc(c)+'</span>'+
           '<span class=muted style="font-size:10.5px">existing</span>');
@@ -3151,10 +3154,11 @@ function rowHtml(n){
       'moving it changes what they see, and Drive may refuse">not yours'+
       '</span>':'')+
     (n.shared&&n.owned!==false?'<span class="tag stay">shared</span>':'')+
-    (n.folder&&n.empty?'<span class="tag stay emptytag">empty</span>'+
-      '<button class=rowx title="delete this empty folder" '+
-      'onclick="event.stopPropagation();rmdir(\''+esc(n.id)+'\',\''+
-      esc(n.name).replace(/'/g,"\\'")+'\',this)">&#128465;</button>':'')+
+    (n.folder&&n.empty?'<span class="tag stay emptytag">empty</span>':'')+
+    '<button class=rowx title="move to Drive trash" '+
+    'onclick="event.stopPropagation();trashItem(\''+esc(n.id)+'\',\''+
+    esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
+    ',this)">&#128465;</button>'+
     '<span class=mt'+statTitle+'>'+esc(stats)+'</span>'+
     (anc? '<span class="tag stay">moves with '+esc(anc.split('/').pop())+
       '</span>'
@@ -3754,18 +3758,51 @@ async function loadText(url){
       esc(niceErr(e))+'</span>';
   }
 }
-// Delete an empty folder: confirmed, sent to Drive's trash, logged so the
-// CLI can restore it (undo folder_actions.jsonl --execute).
-async function rmdir(fid, name, btn){
-  const ok = await uiConfirm('Delete the empty folder <b>'+esc(name)+
-    '</b>?<br><span class=muted>It goes to the Drive trash — recoverable '+
-    'for 30 days — and the action is recorded in '+
-    'logs/folder_actions.jsonl.</span>',
-    {title:'Delete empty folder', yes:'Delete', danger:true});
+// Delete a file or folder. It goes to Drive's trash, which is exactly what
+// deleting in Drive itself does — recoverable for 30 days, then Drive
+// removes it permanently. The confirmation says so, and for a folder it
+// states how much goes with it, read live rather than from the last scan.
+async function trashItem(fid, name, isFolder, btn){
+  const undoBtn = busy(btn);
+  let info = null;
+  try{ info = await api('/api/iteminfo?id='+encodeURIComponent(fid)); }
+  catch(e){ /* fall back to a confirmation without the detail */ }
+  undoBtn();
+  if(info && info.can_trash === false){
+    await uiAlert('Drive will not let you move <b>'+esc(name)+
+      '</b> to the trash — it belongs to someone else. Ask its owner, or '+
+      'remove your own access from the Sharing tab instead.',
+      {title:'Cannot delete this'});
+    return;
+  }
+  let inside = '';
+  if(isFolder && info){
+    if(info.direct){
+      inside = '<br><br><b>Everything inside goes with it</b> — '+
+        info.direct.toLocaleString()+(info.more?'+':'')+' item'+
+        (info.direct===1?'':'s')+' directly inside'+
+        (info.scan_files
+          ? ', '+info.scan_files.toLocaleString()+
+            ' files in total at your last scan' : '')+'.';
+    } else {
+      inside = '<br><br><span class=muted>The folder is empty.</span>';
+    }
+  } else if(info && info.size){
+    inside = ' <span class=muted>('+human(info.size)+')</span>';
+  }
+  const ok = await uiConfirm(
+    'Move '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b> to the '+
+    'Drive trash?'+inside+
+    '<br><br><span class=muted>This is the same as deleting it in Drive: '+
+    'it stays in the trash for 30 days and can be restored at any time '+
+    'from the Trash tab, after which Drive deletes it permanently. The '+
+    'action is recorded in logs/trash_actions.jsonl, so '+
+    '<code>undo</code> can bring it back too.</span>',
+    {title:'Move to trash', yes:'Move to trash', danger:true});
   if(!ok) return;
   const undo = busy(btn);
   try{
-    await api('/api/rmdir',{id:fid});
+    await api('/api/trashitem',{id:fid});
     const nd = btn.closest('.tnode');
     const gone = nd ? nd.dataset.path : '';
     // The parent may itself be empty now — find it before detaching.
@@ -3793,11 +3830,11 @@ async function rmdir(fid, name, btn){
     if(parentNode) refreshEmptyState(parentNode);
   }catch(e){
     undo();
-    uiAlert(esc(niceErr(e)), {title:'Could not delete the folder'});
+    uiAlert(esc(niceErr(e)), {title:'Could not move it to the trash'});
   }
 }
-// Give a row the "empty" badge and its delete button the moment its last
-// child goes, so the tree stays truthful without pressing Refresh.
+// Keep the "empty" badge truthful the moment a folder's last child goes,
+// so the tree does not need a Refresh to tell the truth.
 function refreshEmptyState(nd){
   const kids = nd.querySelector(':scope > .kids');
   const row = nd.querySelector(':scope > .trow');
@@ -3805,8 +3842,7 @@ function refreshEmptyState(nd){
   if(!kids.dataset.loaded) return;          // contents unknown — say nothing
   const isEmpty = !kids.querySelector(':scope > .tnode');
   const has = !!row.querySelector('.emptytag');
-  const id = nd.dataset.id;
-  const item = findItem(id);
+  const item = findItem(nd.dataset.id);
   if(item){
     item.empty = isEmpty;
     if(isEmpty){ item.files = null; item.bytes = null; }
@@ -3816,21 +3852,12 @@ function refreshEmptyState(nd){
     const tag = document.createElement('span');
     tag.className = 'tag stay emptytag';
     tag.textContent = 'empty';
-    const del = document.createElement('button');
-    del.className = 'rowx';
-    del.title = 'delete this empty folder';
-    del.innerHTML = '&#128465;';
-    del.onclick = function(e){
-      e.stopPropagation();
-      rmdir(id, (nd.dataset.path||'').split('/').pop(), del);
-    };
     row.insertBefore(tag, mt);
-    row.insertBefore(del, mt);
     if(mt) mt.textContent = '';            // stale totals no longer apply
     kids.innerHTML = '<div class=muted style="padding:5px 6px;'+
       'font-size:13px">empty</div>';
   } else if(!isEmpty && has){
-    row.querySelectorAll('.emptytag, .rowx').forEach(el=>el.remove());
+    row.querySelectorAll('.emptytag').forEach(el=>el.remove());
   }
 }
 function filterTree(){
@@ -4396,6 +4423,16 @@ async function poll(){
     ((s.undo_log && !undone)
       ? '<button class="btn ghost" onclick=undoRun()>Undo everything</button>'
       : '')+'</div>';
+  // Destinations used by this run now exist in Drive, so they stop being
+  // "something you typed that can be removed" and become ordinary folders.
+  // Leaving an x on them afterwards offers an action with no meaning.
+  const used = Object.values(PLAN).map(p=>p.target).filter(Boolean);
+  used.forEach(t=>{
+    const i = USER_CATS.indexOf(t);
+    if(i!==-1) USER_CATS.splice(i,1);
+    DISCOVERED.add(t);
+  });
+  if(used.length){ saveCats(); rebuildCats(); }
   Object.keys(PLAN).forEach(k=>delete PLAN[k]);
   drawPlan();
   loadRuns();
@@ -5315,6 +5352,44 @@ def run_ui(args) -> None:
                 self.end_headers()
                 self.wfile.write(logo_bytes)
                 return
+            if u.path == "/api/iteminfo":
+                # What deleting this would actually take with it, read live
+                # so the confirmation states real numbers rather than the
+                # last scan's.
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                q = urllib.parse.parse_qs(u.query)
+                fid = (q.get("id") or [""])[0]
+                try:
+                    meta = locked(service.files().get(
+                        fileId=fid, fields="id,name,mimeType,size,"
+                                           "ownedByMe,capabilities(canTrash)"))
+                    folder = meta.get("mimeType") == FOLDER_MIME
+                    direct = 0
+                    more = False
+                    if folder:
+                        resp = locked(service.files().list(
+                            q=f"'{fid}' in parents and trashed = false",
+                            fields="nextPageToken, files(id)",
+                            pageSize=1000))
+                        direct = len(resp.get("files", []))
+                        more = bool(resp.get("nextPageToken"))
+                    st = stats.get(fid, {})
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"}, 500)
+                    return
+                self._send({
+                    "name": meta.get("name", ""), "folder": folder,
+                    "size": int(meta.get("size") or 0),
+                    "direct": direct, "more": more,
+                    "owned": bool(meta.get("ownedByMe", True)),
+                    "can_trash": (meta.get("capabilities") or {}).get(
+                        "canTrash", True),
+                    "scan_files": st.get("files"),
+                    "scan_bytes": st.get("bytes")})
+                return
+
             if u.path == "/api/zip":
                 # Lists what is inside an archive without extracting it.
                 # Nothing is written anywhere: the bytes are read into
@@ -5720,24 +5795,24 @@ def run_ui(args) -> None:
                 self._send({"ok": True})
                 return
 
-            if u.path == "/api/rmdir":
+            if u.path == "/api/trashitem":
+                # Moves any file or folder to Drive's trash. This is still
+                # not a delete: Drive keeps trashed items for 30 days and
+                # they can be restored from the Trash tab, or by undoing
+                # the log this writes. The tool has no permanent-delete.
                 fid = (body.get("id") or "").strip()
                 if not fid:
                     self._send({"error": "missing id"}, 400)
                     return
                 try:
                     meta = locked(service.files().get(
-                        fileId=fid, fields="id,name,mimeType"))
-                    if meta.get("mimeType") != FOLDER_MIME:
-                        self._send({"error": "not a folder"}, 400)
-                        return
-                    # Emptiness is re-checked server-side at this moment —
-                    # the flag in the page could be stale.
-                    kids = locked(service.files().list(
-                        q=f"'{fid}' in parents and trashed = false",
-                        fields="files(id)", pageSize=1)).get("files")
-                    if kids:
-                        self._send({"error": "folder is not empty"}, 400)
+                        fileId=fid,
+                        fields="id,name,mimeType,capabilities(canTrash)"))
+                    if (meta.get("capabilities") or {}).get(
+                            "canTrash") is False:
+                        self._send({"error": "Drive will not let you trash "
+                                             "this — you may not own it"},
+                                   403)
                         return
                     locked(service.files().update(
                         fileId=fid, body={"trashed": True}))
@@ -5745,11 +5820,12 @@ def run_ui(args) -> None:
                     self._send({"error": f"{type(err).__name__}: {err}"}, 500)
                     return
                 os.makedirs(LOG_DIR, exist_ok=True)
-                with open(os.path.join(LOG_DIR, "folder_actions.jsonl"),
+                with open(os.path.join(LOG_DIR, "trash_actions.jsonl"),
                           "a", encoding="utf-8") as fh:
                     fh.write(json.dumps({
                         "op": "trash", "file_id": fid,
                         "name": meta.get("name"),
+                        "folder": meta.get("mimeType") == FOLDER_MIME,
                         "at": datetime.now().isoformat(
                             timespec="seconds")}) + "\n")
                 self._send({"ok": True})
