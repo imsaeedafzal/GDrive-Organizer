@@ -3045,15 +3045,15 @@ function drawCats(){
 }
 // Undo every selection pointing at a destination, from the chip.
 async function clearDest(c){
-  const hits = Object.keys(PLAN).filter(
-    k=>PLAN[k].target===c || PLAN[k].target.indexOf(c+'/')===0);
+  const hits = Object.values(PLAN).filter(
+    p=>p.target===c || p.target.indexOf(c+'/')===0);
   if(!hits.length) return;
   if(!await uiConfirm('Clear '+hits.length+' selection'+
       (hits.length===1?'':'s')+' pointing at <b>'+esc(c)+'</b>?'+
       '<br><span class=muted>Those items go back to staying where they '+
       'are. Nothing in your Drive changes.</span>',
       {title:'Clear selections', yes:'Clear'})) return;
-  hits.forEach(k=>delete PLAN[k]);
+  hits.forEach(p=>delete PLAN[p.id]);
   drawPlan(); refreshTags(); redrawSelects();
 }
 function addCat(){
@@ -3088,8 +3088,8 @@ async function delCat(c){
   if(used && !await uiConfirm(used+' planned move'+(used===1?'':'s')+
     ' use <b>'+esc(c)+'</b>. Remove '+(used===1?'it':'them')+' too?',
     {title:'Remove destination', yes:'Remove'})) return;
-  Object.keys(PLAN).forEach(k=>{
-    if(PLAN[k].target===c||PLAN[k].target.startsWith(c+'/')) delete PLAN[k];});
+  Object.values(PLAN).forEach(p=>{
+    if(p.target===c||p.target.startsWith(c+'/')) delete PLAN[p.id];});
   const ui=USER_CATS.indexOf(c);
   if(ui!==-1){ USER_CATS.splice(ui,1); saveCats(); }
   rebuildCats(); drawCats(); redrawSelects(); drawPlan();
@@ -3221,16 +3221,22 @@ async function children(id, path){
   if(added){ rebuildCats(); drawCats(); redrawSelects(); }
   return d.items;
 }
+// PLAN is keyed by Drive id, not path: a Drive can hold two folders with
+// the same full path, and keying by path made them one entry — so only one
+// could be planned, and neither could be dragged onto the other.
 function ancestorPlanned(path){
-  const parts=path.split('/');
-  for(let n=parts.length-1;n>0;n--){
-    const a=parts.slice(0,n).join('/');
-    if(PLAN[a]) return a;
-  }
-  return null;
+  let best = null;
+  Object.values(PLAN).forEach(p=>{
+    if(p.path && path.indexOf(p.path+'/')===0 &&
+       (!best || p.path.length > best.length)) best = p.path;
+  });
+  return best;
+}
+function plannedFor(nd){
+  return nd && nd.dataset ? PLAN[nd.dataset.id] : null;
 }
 function rowHtml(n){
-  const planned = PLAN[n.path];
+  const planned = PLAN[n.id];
   const anc = ancestorPlanned(n.path);
   const stats = (n.files!=null? n.files.toLocaleString()+' files':'') +
     (n.bytes? ' · '+human(n.bytes):'') +
@@ -3292,7 +3298,7 @@ function redrawSelects(){
   document.querySelectorAll('#tree .tnode, #results .tnode').forEach(nd=>{
     const b = nd.querySelector(':scope > .trow > .destbtn');
     if(!b) return;
-    const cur = (PLAN[nd.dataset.path]||{}).target||'';
+    const cur = (PLAN[nd.dataset.id]||{}).target||'';
     const label = cur ? cur : 'leave where it is';
     b.className = 'destbtn' + (cur?' set':'');
     b.title = label;
@@ -3466,7 +3472,7 @@ function pickRows(){
   const typed = raw.trim().replace(/^\/+|\/+$/g,'');
   const own = PICK.path && isFolderPath(PICK.path) ? PICK.path : '';
   const here = parentOf(PICK.path);      // where it already lives
-  const cur = (PLAN[PICK.path]||{}).target||'';
+  const cur = (PLAN[PICK.id]||{}).target||'';
   const rows = [];
   rows.push({kind:'item', value:'', label:'leave where it is',
              checked:!cur});
@@ -3628,8 +3634,8 @@ async function tog(el,id,path){
   }catch(e){ el.innerHTML='&#9656;';
     uiAlert(esc(niceErr(e)), {title:'Could not read that folder'}); }
 }
-async function setDest(path, id, name, target){
-  if(!target){ delete PLAN[path]; }
+async function setDest(path, id, name, target, targetId){
+  if(!target){ delete PLAN[id]; }
   else{
     const anc = ancestorPlanned(path);
     if(anc){
@@ -3638,26 +3644,39 @@ async function setDest(path, id, name, target){
         'folder to move separately.', {title:'Already moving'});
       return;
     }
-    if(target===path || target.indexOf(path+'/')===0){
+    // Identity is the id. Two folders can share a path, so comparing
+    // paths here would refuse a legitimate move between them.
+    if(targetId && targetId===id){
       uiAlert('A folder cannot move into itself.', {title:'Impossible move'});
+      return;
+    }
+    if(!targetId && (target===path || target.indexOf(path+'/')===0)){
+      uiAlert('A folder cannot move into itself.', {title:'Impossible move'});
+      return;
+    }
+    if(targetId && target.indexOf(path+'/')===0){
+      uiAlert('A folder cannot move inside itself.',
+        {title:'Impossible move'});
       return;
     }
     // Last line of defence: the picker greys this out, but a typed path
     // could still name the folder the item is already sitting in.
-    if(target===parentOf(path)){
+    if(!targetId && target===parentOf(path)){
       uiAlert('<b>'+esc(name)+'</b> is already in <b>'+esc(target)+
         '</b> — that move would do nothing.', {title:'Already there'});
       return;
     }
     // a planned descendant would be carried along — clear those
-    const drop = Object.keys(PLAN).filter(k=>k.startsWith(path+'/'));
+    const drop = Object.values(PLAN).filter(
+      p=>p.path && p.path.indexOf(path+'/')===0);
     if(drop.length && !await uiConfirm(drop.length+' planned move'+
       (drop.length===1?'':'s')+' inside this folder will be removed, '+
       'because moving this folder carries them along.<br><br>Continue?',
       {title:'Overlapping plans', yes:'Continue'})){
       return; }
-    drop.forEach(k=>delete PLAN[k]);
-    PLAN[path] = {id:id, name:name, target:target, path:path};
+    drop.forEach(p=>delete PLAN[p.id]);
+    PLAN[id] = {id:id, name:name, target:target, path:path,
+                targetId:targetId||''};
   }
   drawPlan(); refreshTags(); redrawSelects();
 }
@@ -3681,7 +3700,9 @@ function refreshTags(){
   paintRows();
 }
 function savePlan(){
-  try{ localStorage.setItem('gdo_plan', JSON.stringify(PLAN)); }catch(e){}
+  // Key bumped: the old store was keyed by path, which cannot represent
+  // two folders sharing one.
+  try{ localStorage.setItem('gdo_plan2', JSON.stringify(PLAN)); }catch(e){}
 }
 // Colour the rows so annotations are visible at a glance: a planned row gets
 // an accent bar, everything that will be carried along by a planned ancestor
@@ -3690,13 +3711,18 @@ function paintRows(){
   document.querySelectorAll('#tree .tnode, #results .tnode').forEach(nd=>{
     const row = nd.querySelector(':scope > .trow');
     if(!row) return;
-    const p = nd.dataset.path;
-    row.classList.toggle('planned', !!PLAN[p]);
-    row.classList.toggle('carried', !PLAN[p] && !!ancestorPlanned(p));
+    const p = nd.dataset.path, mine = PLAN[nd.dataset.id];
+    row.classList.toggle('planned', !!mine);
+    row.classList.toggle('carried', !mine && !!ancestorPlanned(p));
   });
 }
 function drawPlan(){
-  const keys = Object.keys(PLAN).sort();
+  // Sorted by path for reading; keyed by id underneath, so two items with
+  // the same path both appear instead of one silently replacing the other.
+  const keys = Object.keys(PLAN).sort((a,b)=>{
+    const pa=(PLAN[a].path||''), pb=(PLAN[b].path||'');
+    return pa<pb?-1:(pa>pb?1:0);
+  });
   document.getElementById('cnt').textContent = keys.length;
   const go = document.getElementById('go');
   go.disabled = !keys.length;
@@ -3709,10 +3735,11 @@ function drawPlan(){
   document.getElementById('pend').innerHTML = keys.length
     ? keys.map(k=>'<div class=pi><button class="a deststyle" title="show '+
         'this in the tree" onclick="revealPath(\''+
-        esc(k).replace(/'/g,"\\'")+'\',true)">'+esc(k)+'</button>'+
+        esc(PLAN[k].path).replace(/'/g,"\\'")+'\',true)">'+
+        esc(PLAN[k].path)+'</button>'+
         '<span class=tag>'+esc(PLAN[k].target)+'</span>'+
         '<button class=x title="remove this selection" onclick="unplan(\''+
-        esc(k).replace(/'/g,"\\'")+'\')">&times;</button></div>').join('')
+        esc(k)+'\')">&times;</button></div>').join('')
     : '<div class=muted style="font-size:13px;padding:6px 0">Nothing planned '+
       'yet. Everything stays exactly where it is.</div>';
   savePlan(); paintRows(); drawCats();
@@ -3764,7 +3791,7 @@ async function runSearch(){
   drawClear();
 }
 function resultRow(n){
-  const planned = PLAN[n.path];
+  const planned = PLAN[n.id];
   const stats = (n.files!=null ? n.files.toLocaleString()+' files' : '') +
     (n.bytes ? ' · '+human(n.bytes) : '') +
     (!n.folder && n.size ? human(n.size) : '');
@@ -3839,12 +3866,14 @@ function dragEnd(row){
   DRAG = null;
 }
 // Why a drop would be refused, or null when it is fine.
-function dropRefusal(destPath){
+// Identity is the Drive id, never the path: two folders can share a path,
+// and comparing paths refused a perfectly good move from one onto the
+// other — which is exactly how you would merge a duplicated folder.
+function dropRefusal(destPath, destId){
   if(!DRAG) return 'nothing is being dragged';
-  if(DRAG.path === destPath) return 'that is the item itself';
+  if(DRAG.id === destId) return 'that is the folder itself';
   if(DRAG.folder && destPath.indexOf(DRAG.path+'/')===0)
     return 'a folder cannot move inside itself';
-  if(parentOf(DRAG.path) === destPath) return 'it is already here';
   const anc = ancestorPlanned(DRAG.path);
   if(anc) return '"'+anc+'" is already moving and would carry this along';
   return null;
@@ -3853,7 +3882,7 @@ function dragOver(ev, row){
   if(!DRAG) return;
   const nd = row.closest('.tnode');
   if(!nd || nd.dataset.folder!=='1') return;
-  const refusal = dropRefusal(nd.dataset.path);
+  const refusal = dropRefusal(nd.dataset.path, nd.dataset.id);
   ev.preventDefault();      // required for drop to fire at all
   ev.dataTransfer.dropEffect = refusal ? 'none' : 'move';
   row.classList.toggle('dropok', !refusal);
@@ -3867,16 +3896,18 @@ async function dropOn(ev, row){
   const nd = row.closest('.tnode');
   row.classList.remove('dropok','dropno');
   if(!nd || !DRAG) return;
-  const dest = nd.dataset.path;
+  const dest = nd.dataset.path, destId = nd.dataset.id;
   const item = DRAG;              // dragEnd clears it once the drop settles
-  const refusal = dropRefusal(dest);
+  const refusal = dropRefusal(dest, destId);
   if(refusal){
     await uiAlert('<b>'+esc(item.name)+'</b> cannot go into <b>'+
       esc(dest)+'</b> — '+esc(refusal)+'.', {title:'Cannot drop here'});
     return;
   }
   // Same funnel as the picker: guards, overlap handling, persistence.
-  await setDest(item.path, item.id, item.name, dest);
+  // The destination id travels with it, so a duplicated path cannot send
+  // this to the wrong folder of that name.
+  await setDest(item.path, item.id, item.name, dest, destId);
   pushRecent(dest);
   const target = findNode(item.path);
   if(target){
@@ -4093,13 +4124,10 @@ async function renameItem(fid, name, isFolder, btn){
   if(oldPath){
     const parent = parentOf(oldPath);
     const newPath = parent ? parent+'/'+next : next;
-    Object.keys(PLAN).forEach(k=>{
-      if(k===oldPath || k.indexOf(oldPath+'/')===0){
-        const moved = newPath + k.slice(oldPath.length);
-        PLAN[moved] = PLAN[k];
-        PLAN[moved].path = moved;
-        if(k===oldPath) PLAN[moved].name = next;
-        delete PLAN[k];
+    Object.values(PLAN).forEach(p=>{
+      if(p.path===oldPath || (p.path||'').indexOf(oldPath+'/')===0){
+        if(p.path===oldPath) p.name = next;
+        p.path = newPath + p.path.slice(oldPath.length);
       }
     });
     Object.values(PLAN).forEach(p=>{
@@ -4189,7 +4217,7 @@ async function trashItem(fid, name, isFolder, btn){
     const parentNode = nd && nd.parentElement
       ? nd.parentElement.closest('.tnode') : null;
     if(nd){
-      if(PLAN[nd.dataset.path]){ delete PLAN[nd.dataset.path]; drawPlan(); }
+      if(PLAN[nd.dataset.id]){ delete PLAN[nd.dataset.id]; drawPlan(); }
       nd.remove();
     }
     Object.keys(CACHE).forEach(k=>{
@@ -4700,7 +4728,7 @@ async function revealPath(path, flash){
 }
 // After a reload, open the tree to everything still waiting to be executed.
 async function revealPlanned(){
-  const paths = Object.keys(PLAN);
+  const paths = Object.values(PLAN).map(p=>p.path).filter(Boolean);
   if(!paths.length) return;
   const stat = document.getElementById('treestat');
   if(stat) stat.innerHTML = '<span class=spin></span> opening your '+
@@ -4732,8 +4760,9 @@ async function revealPlanned(){
 }
 // Clicking a destination shows what you assigned to it.
 async function revealDest(c){
-  const hits = Object.keys(PLAN).filter(
-    k=>PLAN[k].target===c || PLAN[k].target.indexOf(c+'/')===0);
+  const hits = Object.values(PLAN)
+    .filter(p=>p.target===c || p.target.indexOf(c+'/')===0)
+    .map(p=>p.path).filter(Boolean);
   if(!hits.length) return;
   for(const p of hits.slice(1)) await revealPath(p, false);
   await revealPath(hits[0], true);
@@ -4917,7 +4946,7 @@ async function run(btn){
   box.innerHTML='<h2 style="margin-top:0">Running</h2>'+
     '<div class=pbar><div class=pfill id=pf></div></div>'+
     '<div id=pt class=muted>starting…</div><div class=plog id=pl></div>';
-  try{ localStorage.removeItem('gdo_plan'); }catch(e){}
+  try{ localStorage.removeItem('gdo_plan2'); }catch(e){}
   poll();
 }
 async function poll(){
@@ -5108,9 +5137,10 @@ async function boot(){
   // Un-executed annotations survive a refresh or a closed tab; they are
   // cleared the moment a run starts, because the server owns them from then.
   try{
-    const sp = JSON.parse(localStorage.getItem('gdo_plan')||'{}');
+    const sp = JSON.parse(localStorage.getItem('gdo_plan2')||'{}');
     Object.keys(sp).forEach(k=>{
-      if(sp[k] && sp[k].id && sp[k].target) PLAN[k]=sp[k];
+      const v = sp[k];
+      if(v && v.id && v.target && v.path) PLAN[v.id]=v;
     });
   }catch(e){}
   // If a run is in flight — because the tab was refreshed or reopened — pick
@@ -5791,10 +5821,32 @@ def run_ui(args) -> None:
                     job.current = item["path"]
                     try:
                         tgt, pth = item["target"], item["path"]
-                        if tgt == pth or tgt.startswith(pth + "/"):
+                        tid = (item.get("targetId") or "").strip()
+                        if tgt.startswith(pth + "/"):
                             raise ValueError(
                                 "cannot move a folder into itself")
-                        parent = folders.resolve(tgt)
+                        if tid:
+                            # Chosen by dragging onto a specific folder, so
+                            # the id is authoritative. Resolving the path
+                            # instead would be ambiguous whenever two
+                            # folders share it — the exact case this is for.
+                            if tid == item["id"]:
+                                raise ValueError(
+                                    "cannot move a folder into itself")
+                            chk = locked(service.files().get(
+                                fileId=tid, fields="id,mimeType,trashed"))
+                            if chk.get("mimeType") != FOLDER_MIME:
+                                raise ValueError(
+                                    "the destination is not a folder")
+                            if chk.get("trashed"):
+                                raise ValueError(
+                                    "the destination is in the trash")
+                            parent = tid
+                        else:
+                            if tgt == pth:
+                                raise ValueError(
+                                    "cannot move a folder into itself")
+                            parent = folders.resolve(tgt)
                         if parent == item["id"]:
                             raise ValueError(
                                 f"'{pth}' IS the destination folder — "
@@ -6416,11 +6468,15 @@ def run_ui(args) -> None:
                 for it in plan:
                     tgt = it.get("target") or ""
                     pth = it.get("path") or ""
-                    if tgt == pth or tgt.startswith(pth + "/"):
+                    tid = it.get("targetId") or ""
+                    if tgt.startswith(pth + "/") or (
+                            not tid and tgt == pth) or tid == it.get("id"):
                         warnings.append(
                             f"{pth}: cannot move a folder into itself")
                     parent_dir = pth.rsplit("/", 1)[0] if "/" in pth else ""
-                    if tgt and tgt == parent_dir:
+                    # With an explicit destination id this is a real move
+                    # between two same-named folders, not a no-op.
+                    if tgt and not tid and tgt == parent_dir:
                         warnings.append(f"{pth}: already inside {tgt} — "
                                         f"nothing will change")
                     if not it.get("id"):
@@ -6456,12 +6512,15 @@ def run_ui(args) -> None:
                 groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = \
                     defaultdict(list)
                 for it in plan:
-                    groups[((it.get("target") or ""),
-                            (it.get("name") or "").lower())].append(it)
+                    # Group by the actual destination folder where one was
+                    # named, so two same-path destinations are not conflated.
+                    key = (it.get("targetId") or it.get("target") or "")
+                    groups[(key, (it.get("name") or "").lower())].append(it)
                 collisions = [
-                    {"target": t, "name": g[0].get("name") or "",
+                    {"target": g[0].get("target") or "",
+                     "name": g[0].get("name") or "",
                      "paths": [x.get("path") or "" for x in g]}
-                    for (t, _n), g in groups.items() if len(g) > 1]
+                    for (_k, _n), g in groups.items() if len(g) > 1]
                 ops = [{"from": it["path"],
                         "to": it["target"] + "/" + it["name"]}
                        for it in plan]
