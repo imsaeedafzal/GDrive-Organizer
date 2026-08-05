@@ -2249,8 +2249,12 @@ gdrive_organizer — scan, propose, apply, review.
   verify      check every baseline file ID still exists                READ ONLY
   undo        reverse any apply or quarantine run
 
-Nothing is ever permanently deleted. The strongest action available is a move,
-or — on an explicit click in `review` — Drive's trash, recoverable for 30 days.
+Nothing is ever permanently deleted. The strongest actions available are a
+move, trashing a folder that is verifiably empty, and removing one sharing
+permission — each on an explicit click, each logged, each reversible with
+`undo`. Drive's trash is recoverable for 30 days.
+
+All generated files (undo logs, manifests, the folder index) live in logs/.
 """
 
 
