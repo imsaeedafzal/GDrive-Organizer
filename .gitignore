@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Secrets — these grant full read/write access to a Google Drive account.
+# Never commit them. If either is ever pushed by accident, revoke the OAuth
+# client in Google Cloud Console rather than only deleting the commit.
+# ---------------------------------------------------------------------------
+credentials.json
+token.json
+*.credentials.json
+client_secret*.json
+
+# ---------------------------------------------------------------------------
+# Generated data. All of it describes a real Drive — file names, folder
+# structure, file IDs, owners — so it is private even though it is not a
+# credential.
+# ---------------------------------------------------------------------------
+drive_scan/
+logs/
+*.jsonl
+preview.html
+mapping.csv
+quarantine_manifest.json
+quarantine_manifest.md
+verify_gone.csv
+folder_index.json
+
+# ---------------------------------------------------------------------------
+# Screenshots of the running app show real folder names, client names and
+# file names. Redact before committing any.
+# ---------------------------------------------------------------------------
+screenshots/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
