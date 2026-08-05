@@ -2620,6 +2620,9 @@ color:var(--s1)}
 .cat.inuse .cnt{background:var(--s1);color:#fff;border-radius:9px;
 padding:0 6px;font-size:11px;font-weight:700}
 /* Every close/remove control in the app: no button chrome, red intent. */
+.noask{border-color:var(--crit);color:var(--crit);padding:5px 11px;
+line-height:1;flex:none}
+.noask:hover{background:rgba(208,59,59,.12);border-color:var(--crit)}
 .cfmchk{display:flex;align-items:center;gap:8px;margin-top:16px;
 padding-top:13px;border-top:1px solid var(--grid);font-size:13px;
 color:var(--ink2);cursor:pointer}
@@ -2686,15 +2689,15 @@ the same as deleting in Drive itself. Every change is logged and reversible.
     </div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
       <strong>My Drive</strong>
-      <span id=treestat class=muted style="font-size:12px"></span>
-      <span id=noask class=muted
-        style="font-size:12px;flex:1;color:var(--crit)"></span>
+      <span id=treestat class=muted style="font-size:12px;flex:1"></span>
       <label id=onlyshared style="display:none;font-size:12.5px;
         color:var(--ink2);white-space:nowrap">
         <input type=checkbox id=hideunshared onchange=filterTree()>
         only shared</label>
       <input id=filter oninput=filterTree() placeholder="filter visible…"
         style="width:200px">
+      <button id=noask class="btn ghost noask" style="display:none"
+        onclick="TRASH_NOASK=false;drawNoAsk()">&#128277;</button>
       <button class="btn ghost" onclick="refreshActive(this)">Refresh</button>
     </div>
     <div id=sharehead class=note style="display:none;margin:0 0 12px"></div>
@@ -3791,13 +3794,15 @@ async function loadText(url){
 // they ever turned it off.
 let TRASH_NOASK = false;
 let TRASHED_COUNT = 0;
+// Shown only while confirmations are suppressed: a muted-bell toggle that
+// sits with the other toolbar actions rather than a sentence in the header.
 function drawNoAsk(){
   const el = document.getElementById('noask');
   if(!el) return;
-  el.innerHTML = TRASH_NOASK
-    ? 'delete confirmations off '+
-      '<button class="btn ghost" style="padding:1px 8px;font-size:11.5px" '+
-      'onclick="TRASH_NOASK=false;drawNoAsk()">turn back on</button>'
+  el.style.display = TRASH_NOASK ? '' : 'none';
+  el.title = TRASH_NOASK
+    ? 'Delete confirmations are off for this session — click to turn them '+
+      'back on'
     : '';
 }
 async function trashItem(fid, name, isFolder, btn){
