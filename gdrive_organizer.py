@@ -4851,7 +4851,13 @@ async function execute(){
   const items = Object.values(PLAN);
   if(!items.length) return;
   for(const it of items){
-    if(it.target===it.path || it.target.indexOf(it.path+'/')===0){
+    // Identity is the id. When a destination folder was named explicitly
+    // — by dragging onto it — an identical path means a different folder
+    // that happens to share the name, which is a legitimate move.
+    const intoItself = it.targetId
+      ? it.targetId === it.id
+      : it.target === it.path;
+    if(intoItself || it.target.indexOf(it.path+'/')===0){
       await uiAlert('<b>'+esc(it.path)+'</b> cannot move into <b>'+
         esc(it.target)+'</b> — that is itself, or inside itself. Remove '+
         'that entry first.', {title:'Impossible move'});
@@ -5752,10 +5758,15 @@ def run_ui(args) -> None:
             cur = hits[0]["id"]
         return cur
 
-    def find_clash(target: str, name: str,
-                   moving_id: str) -> Optional[Dict[str, Any]]:
-        """An item already called `name` inside `target`, if any."""
-        parent = resolve_existing(target)
+    def find_clash(target: str, name: str, moving_id: str,
+                   parent_id: str = "") -> Optional[Dict[str, Any]]:
+        """An item already called `name` inside the destination, if any.
+
+        `parent_id` names the destination exactly. Resolving `target` by
+        path is ambiguous whenever two folders share it, so callers that
+        know the id pass it.
+        """
+        parent = parent_id or resolve_existing(target)
         if not parent:
             return None
         safe = (name or "").replace("\\", "\\\\").replace("'", "\\'")
@@ -5859,7 +5870,7 @@ def run_ui(args) -> None:
                         # may have changed since you looked at it.
                         if on_conflict == "replace":
                             ex = find_clash(tgt, item.get("name") or "",
-                                            item["id"])
+                                            item["id"], parent)
                             # Never trash something this same run just
                             # moved in. Two selections sharing a name would
                             # otherwise have the second delete the first,
@@ -6494,7 +6505,8 @@ def run_ui(args) -> None:
                     try:
                         ex = find_clash(it.get("target") or "",
                                         it.get("name") or "",
-                                        it.get("id") or "")
+                                        it.get("id") or "",
+                                        it.get("targetId") or "")
                     except Exception:
                         ex = None
                     if ex:
