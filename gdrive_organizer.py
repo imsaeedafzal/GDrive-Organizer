@@ -1664,6 +1664,26 @@ MAX_ZIP_ENTRIES = 2000
 MAX_SHARE_DETAIL = 1500                # per-item permission lookups
 SEARCH_LIMIT = 200                     # name-search results per query
 MAX_BODY = 64 * 1024 * 1024            # a request body is a plan, not data
+COOKIE_NAME = "gdo_session"
+
+# Files this tool will not read back over HTTP. Browsing the computer is
+# the point, but these are keys: serving them would turn a leaked session
+# token into someone else's Drive, cloud account or server.
+SECRET_NAMES = {"credentials.json", "token.json", ".env", ".netrc",
+                "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}
+SECRET_DIRS = {".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker",
+               ".config/gcloud"}
+
+
+def is_secret_path(path: str) -> bool:
+    p = os.path.abspath(path).replace("\\", "/")
+    name = os.path.basename(p).lower()
+    if name in SECRET_NAMES or name.startswith("client_secret"):
+        return True
+    if name.endswith((".pem", ".pfx", ".p12", ".key", ".keystore")):
+        return True
+    segs = {s.lower() for s in p.split("/")}
+    return bool(segs & {d for d in SECRET_DIRS if "/" not in d})
 
 # ---------------------------------------------------------------------------
 # Local filesystem, for copying into Drive
@@ -4858,12 +4878,13 @@ async function copyText(text, btn){
 // server, which already holds the Drive credentials.
 // One viewer for both trees. `source` is 'drive' or 'local'; everything
 // below is written against the item, not against where it came from.
+// No token in the URL: the session cookie set when the page loaded
+// carries it. A token here would end up in browser history and in
+// anything the reader copies or downloads.
 function fileUrl(it, source){
   return source==='local'
-    ? '/api/localfile?t='+encodeURIComponent(TOKEN)+
-      '&path='+encodeURIComponent(it.path)
-    : '/api/file?t='+encodeURIComponent(TOKEN)+
-      '&id='+encodeURIComponent(it.id);
+    ? '/api/localfile?path='+encodeURIComponent(it.path)
+    : '/api/file?id='+encodeURIComponent(it.id);
 }
 function apiUrlFor(kind, it, source){
   const key = source==='local'
@@ -7537,20 +7558,51 @@ def run_ui(args) -> None:
             host = (self.headers.get("Host") or "").split(":")[0]
             return host in ("127.0.0.1", "localhost")
 
+        def _cookie(self) -> str:
+            """The session cookie, set once when the page is served.
+
+            It exists so media URLs need not carry the token: an <img> or
+            <iframe> cannot send a header, and a token in the URL ends up
+            in browser history and in anything the user copies.
+            """
+            raw = self.headers.get("Cookie") or ""
+            for part in raw.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == COOKIE_NAME:
+                    return v
+            return ""
+
         def _authed(self) -> bool:
-            return self._local() and self.headers.get("X-Auth") == auth
+            return self._local() and (
+                self.headers.get("X-Auth") == auth or self._cookie() == auth)
+
+        def _media_authed(self, q) -> bool:
+            """For things the browser fetches by URL rather than by fetch().
+            The cookie is preferred; the query token still works so a link
+            opened before the cookie was set does not simply fail."""
+            return self._local() and (
+                self._cookie() == auth
+                or (q.get("t") or [""])[0] == auth)
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             if u.path == "/":
                 q = urllib.parse.parse_qs(u.query)
-                if not self._local() or (q.get("t") or [""])[0] != auth:
+                if not self._media_authed(q):
                     self._send({"error": "forbidden"}, 403)
                     return
                 b = page.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(b)))
+                # From here the browser carries the session itself, so no
+                # later URL needs the token in it. HttpOnly keeps it away
+                # from page scripts; SameSite=Strict means another site
+                # cannot cause an authenticated request.
+                self.send_header(
+                    "Set-Cookie",
+                    f"{COOKIE_NAME}={auth}; Path=/; HttpOnly; "
+                    f"SameSite=Strict")
                 self.end_headers()
                 self.wfile.write(b)
                 return
@@ -7731,10 +7783,9 @@ def run_ui(args) -> None:
                 # endpoints so one set of client code renders both.
                 q = urllib.parse.parse_qs(u.query)
                 if u.path == "/api/localfile":
-                    # <img>/<iframe> cannot send headers, so this one
-                    # authenticates on the query token like /api/file.
-                    if not self._local() or (
-                            q.get("t") or [""])[0] != auth:
+                    # Fetched by the browser as a URL, so it accepts the
+                    # session cookie as well as the query token.
+                    if not self._media_authed(q):
                         self.send_response(403)
                         self.end_headers()
                         return
@@ -7744,6 +7795,13 @@ def run_ui(args) -> None:
                 path = (q.get("path") or [""])[0]
                 if not path or not os.path.isfile(_long(path)):
                     self._send({"error": "not a file on this computer"}, 400)
+                    return
+                if is_secret_path(path):
+                    # Listed in the tree, never served. Reading it here
+                    # would hand over a key, and this endpoint is reachable
+                    # with nothing but the session token.
+                    self._send({"error": "this file holds credentials, so "
+                                         "it is not shown here"}, 403)
                     return
                 try:
                     size = os.path.getsize(_long(path))
@@ -7887,10 +7945,10 @@ def run_ui(args) -> None:
             if u.path == "/api/file":
                 # Streams a file's own bytes so previews show the real
                 # thing. <img> and <iframe> cannot send headers, so this
-                # one authenticates on the query token instead — same
+                # one takes the session cookie or the query token — same
                 # secret, same localhost-only Host check.
                 q = urllib.parse.parse_qs(u.query)
-                if not self._local() or (q.get("t") or [""])[0] != auth:
+                if not self._media_authed(q):
                     self.send_response(403)
                     self.end_headers()
                     return
