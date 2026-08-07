@@ -97,7 +97,8 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Set,
+                    Tuple)
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -1811,16 +1812,19 @@ def local_entries(path: str) -> List[Dict[str, Any]]:
     return out
 
 
-def walk_local(root: str, skip_hidden: bool, skip_artifacts: bool
-               ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
-    """Everything under `root` that would be uploaded, plus what would not.
+def iter_local(root: str, skip_hidden: bool, skip_artifacts: bool
+               ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield ("file", entry) or ("skip", entry) for everything under `root`.
 
-    Skips are collected with a reason rather than dropped quietly — a
+    A generator rather than a list because a folder here can hold well
+    over a hundred thousand files, and the counting pass only needs
+    totals. Building the whole list first is what made counting them slow
+    enough to matter.
+
+    Skips are reported with a reason rather than dropped quietly — a
     silent skip is how an upload appears to succeed while leaving things
     behind.
     """
-    files: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, str]] = []
     base = os.path.dirname(os.path.abspath(root))
     for dirpath, dirnames, filenames in os.walk(_long(root)):
         real = dirpath[4:] if dirpath.startswith("\\\\?\\") else dirpath
@@ -1828,29 +1832,42 @@ def walk_local(root: str, skip_hidden: bool, skip_artifacts: bool
         for d in dirnames:
             full = os.path.join(real, d)
             if skip_artifacts and d.lower() in ARTIFACT_SEGMENTS:
-                skipped.append({"path": full, "why": "build folder"})
+                yield "skip", {"path": full, "why": "build folder"}
             elif skip_hidden and is_hidden(full, d):
-                skipped.append({"path": full, "why": "hidden"})
+                yield "skip", {"path": full, "why": "hidden"}
             elif os.path.islink(full):
-                skipped.append({"path": full, "why": "shortcut or link"})
+                yield "skip", {"path": full, "why": "shortcut or link"}
             else:
                 keep.append(d)
         dirnames[:] = keep
         for f in filenames:
             full = os.path.join(real, f)
             if skip_hidden and is_hidden(full, f):
-                skipped.append({"path": full, "why": "hidden"})
+                yield "skip", {"path": full, "why": "hidden"}
                 continue
             try:
                 size = os.path.getsize(_long(full))
             except OSError as err:
-                skipped.append({"path": full,
-                                "why": f"unreadable ({err.strerror or err})"})
+                yield "skip", {"path": full,
+                               "why": f"unreadable ({err.strerror or err})"}
                 continue
-            files.append({
+            yield "file", {
                 "path": full,
                 "rel": os.path.relpath(full, base).replace("\\", "/"),
-                "size": size})
+                "size": size}
+
+
+def walk_local(root: str, skip_hidden: bool, skip_artifacts: bool
+               ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Everything under `root` that would be uploaded, plus what would not.
+
+    The list form, for the uploader itself — it has to hold the whole plan
+    anyway. Anything that only wants totals should walk `iter_local`.
+    """
+    files: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, str]] = []
+    for kind, entry in iter_local(root, skip_hidden, skip_artifacts):
+        (files if kind == "file" else skipped).append(entry)
     return files, skipped
 
 
@@ -4635,18 +4652,65 @@ function uploadOpts(){
   return {skip_hidden: document.getElementById('skiphidden').checked,
           skip_artifacts: document.getElementById('skipart').checked};
 }
+// Counting is a job on the server, because one folder can hold well over
+// a hundred thousand files. This starts it, shows the count climbing, and
+// hands the finished answer to the confirmation dialog.
 async function uploadRun(){
   const items = Object.values(UPLOAD);
   if(!items.length) return;
   const done = busy(document.getElementById('ugo'), 'Checking…');
-  let d;
   try{
-    d = await api('/api/upload/preview',
+    await api('/api/upload/preview',
       Object.assign({plan:items}, uploadOpts()));
   }catch(e){
     uiAlert(esc(niceErr(e)), {title:'Could not read those folders'});
     return;
   }finally{ done(); }
+  const box = document.getElementById('ovbox');
+  box.innerHTML = '<h2 style="margin-top:0">Counting what would go</h2>'+
+    '<p class=muted>Nothing has been uploaded — this only reads the '+
+    'folders you chose, so it can tell you the total first.</p>'+
+    '<p id=scnt style="font-size:15px">reading…</p>'+
+    '<div class=plog id=scur style="max-height:44px"></div>'+
+    '<div style="margin-top:12px"><button class="btn ghost" '+
+    'onclick=cancelScan(this)>Cancel</button></div>';
+  document.getElementById('ov').classList.add('on');
+  let d = null;
+  while(true){
+    let s;
+    try{ s = await api('/api/upload/scan'); }
+    catch(e){
+      box.innerHTML = '<h2 class=warn style="margin-top:0">Could not '+
+        'read those folders</h2><p>'+esc(niceErr(e))+'</p>'+
+        '<button class=btn onclick=closeOv()>Close</button>';
+      return;
+    }
+    const cnt = document.getElementById('scnt');
+    const cur = document.getElementById('scur');
+    if(cnt) cnt.innerHTML = '<strong>'+s.files.toLocaleString()+'</strong> '+
+      'file'+(s.files===1?'':'s')+' so far, '+human(s.bytes)+
+      (s.skipped?' &middot; <span class=warn>'+s.skipped.toLocaleString()+
+        ' skipped</span>':'');
+    if(cur) cur.textContent = s.current || '';
+    if(s.error){
+      box.innerHTML = '<h2 class=warn style="margin-top:0">Could not read '+
+        'those folders</h2><p>'+esc(s.error)+'</p>'+
+        '<button class=btn onclick=closeOv()>Close</button>';
+      return;
+    }
+    if(s.stopped){ closeOv(); return; }
+    if(s.done && s.result){ d = s.result; break; }
+    if(s.done){ closeOv(); return; }
+    await new Promise(r=>setTimeout(r,400));
+  }
+  showUploadConfirm(d);
+}
+async function cancelScan(btn){
+  const done = busy(btn, 'Stopping…');
+  try{ await api('/api/upload/scancancel',{}); }catch(e){}
+  done();
+}
+function showUploadConfirm(d){
   const mode = (document.querySelector('input[name=umode]:checked')||{})
     .value || 'copy';
   const cl = d.clashes || [];
@@ -7014,6 +7078,122 @@ def run_ui(args) -> None:
                         "modified": (h.get("modifiedTime") or "")[:10]}
         return None
 
+    # ---- counting an upload before it starts ------------------------------
+    # Saying what an upload would carry means walking every folder chosen,
+    # and one of those can hold well over a hundred thousand files. Doing
+    # that inside the request means the browser gives up long before the
+    # answer arrives — and it looks like the button did nothing. So the
+    # walk runs as a job, exactly as the sharing sweep does, and the page
+    # watches the count climb.
+    scan: Dict[str, Any] = {"running": False, "done": False, "files": 0,
+                            "bytes": 0, "skipped": 0, "current": "",
+                            "error": "", "cancel": False, "stopped": False,
+                            "result": None}
+    scan_lock = threading.Lock()
+
+    def start_scan(plan: List[Dict[str, Any]], skip_hidden: bool,
+                   skip_art: bool) -> bool:
+        """Start a count unless one is already going. True if this started
+        it.
+
+        The running flag is set here, under a lock, for the same reason
+        the sweep sets its own here: two clicks that arrive together would
+        otherwise both start a walk and reset each other's totals.
+        """
+        with scan_lock:
+            if scan["running"]:
+                return False
+            scan.update(running=True, done=False, files=0, bytes=0,
+                        skipped=0, current="", error="", cancel=False,
+                        stopped=False, result=None)
+        threading.Thread(target=scan_worker,
+                         args=(plan, skip_hidden, skip_art),
+                         daemon=True).start()
+        return True
+
+    def scan_worker(plan: List[Dict[str, Any]], skip_hidden: bool,
+                    skip_art: bool) -> None:
+        files = nbytes = long_paths = skipped_total = 0
+        sample: List[str] = []
+        skipped: List[Dict[str, str]] = []
+        creates: Set[str] = set()
+        clashes: List[Dict[str, Any]] = []
+
+        def note_skip(entry: Dict[str, str]) -> None:
+            # Only the first two hundred are kept; the total is counted in
+            # full, so the summary never understates what is being left.
+            nonlocal skipped_total
+            skipped_total += 1
+            if len(skipped) < 200:
+                skipped.append(entry)
+
+        try:
+            for it in plan:
+                if scan["cancel"]:
+                    break
+                src = it.get("path") or ""
+                tgt = it.get("target") or ""
+                tid = it.get("targetId") or ""
+                scan["current"] = src
+                if not os.path.exists(src):
+                    note_skip({"path": src,
+                               "why": "no longer on this computer"})
+                    continue
+                if os.path.isdir(src):
+                    for kind, entry in iter_local(src, skip_hidden,
+                                                  skip_art):
+                        if scan["cancel"]:
+                            break
+                        if kind == "skip":
+                            note_skip(entry)
+                            continue
+                        files += 1
+                        nbytes += entry["size"]
+                        if len(entry["path"]) > 255:
+                            long_paths += 1
+                        if len(sample) < 200:
+                            sample.append(entry["rel"])
+                        if files % 500 == 0:
+                            scan.update(files=files, bytes=nbytes,
+                                        skipped=skipped_total,
+                                        current=entry["path"])
+                    creates.add(f"{tgt}/{os.path.basename(src)}")
+                else:
+                    files += 1
+                    size = os.path.getsize(_long(src))
+                    nbytes += size
+                    if len(src) > 255:
+                        long_paths += 1
+                    if len(sample) < 200:
+                        sample.append(os.path.basename(src))
+                    creates.add(tgt)
+                scan.update(files=files, bytes=nbytes, skipped=skipped_total)
+                try:
+                    ex = find_clash(tgt, os.path.basename(src), "", tid)
+                except Exception:
+                    ex = None
+                if ex:
+                    clashes.append({"path": src, "target": tgt,
+                                    "name": os.path.basename(src),
+                                    "existing": ex})
+            if scan["cancel"]:
+                scan["stopped"] = True
+            else:
+                scan["result"] = {
+                    "files": files, "bytes": nbytes,
+                    "skipped": skipped, "skipped_total": skipped_total,
+                    "clashes": clashes, "creates": sorted(creates),
+                    # Windows refuses these outright; better to say so now
+                    # than to fail two thirds of the way through.
+                    "long_paths": long_paths,
+                    "recycle": recycle_available(), "sample": sample}
+        except Exception as err:
+            scan["error"] = str(err)
+        finally:
+            scan["running"] = False
+            scan["done"] = True
+            scan["current"] = ""
+
     def perms_of(fid: str) -> List[Dict[str, Any]]:
         """Non-owner permissions on a file, for the Sharing tab."""
         try:
@@ -8089,6 +8269,19 @@ def run_ui(args) -> None:
                             "error": folder_index["error"],
                             "items": search_folders(term)})
                 return
+            if u.path == "/api/upload/scan":
+                # The count in flight, and the whole answer once it is
+                # done. Sent only on completion, so a page that polls
+                # slowly never renders half a total.
+                self._send({"running": scan["running"],
+                            "done": scan["done"], "files": scan["files"],
+                            "bytes": scan["bytes"],
+                            "skipped": scan["skipped"],
+                            "current": scan["current"],
+                            "stopped": scan["stopped"],
+                            "error": scan["error"],
+                            "result": scan["result"]})
+                return
             if u.path == "/api/sweep":
                 self._send({"running": sweep["running"],
                             "done": sweep["done"], "seen": sweep["seen"],
@@ -8420,55 +8613,21 @@ def run_ui(args) -> None:
                 return
 
             if u.path == "/api/upload/preview":
-                plan = body.get("plan") or []
-                skip_hidden = bool(body.get("skip_hidden", True))
-                skip_art = bool(body.get("skip_artifacts", True))
-                files: List[Dict[str, Any]] = []
-                skipped: List[Dict[str, str]] = []
-                clashes = []
-                creates = set()
-                for it in plan:
-                    src = it.get("path") or ""
-                    tgt = it.get("target") or ""
-                    tid = it.get("targetId") or ""
-                    if not os.path.exists(src):
-                        skipped.append({"path": src,
-                                        "why": "no longer on this computer"})
-                        continue
-                    if os.path.isdir(src):
-                        got, miss = walk_local(src, skip_hidden, skip_art)
-                        files.extend({**f, "target": tgt, "targetId": tid}
-                                     for f in got)
-                        skipped.extend(miss)
-                        creates.add(f"{tgt}/{os.path.basename(src)}")
-                    else:
-                        files.append({
-                            "path": src,
-                            "rel": os.path.basename(src),
-                            "size": os.path.getsize(_long(src)),
-                            "target": tgt, "targetId": tid})
-                        creates.add(tgt)
-                    try:
-                        ex = find_clash(tgt, os.path.basename(src), "", tid)
-                    except Exception:
-                        ex = None
-                    if ex:
-                        clashes.append({"path": src, "target": tgt,
-                                        "name": os.path.basename(src),
-                                        "existing": ex})
-                # Windows refuses these outright; better to say so now than
-                # to fail two thirds of the way through a long upload.
-                toolong = [f for f in files if len(f["path"]) > 255]
-                self._send({
-                    "files": len(files),
-                    "bytes": sum(f["size"] for f in files),
-                    "skipped": skipped[:200],
-                    "skipped_total": len(skipped),
-                    "clashes": clashes,
-                    "creates": sorted(creates),
-                    "long_paths": len(toolong),
-                    "recycle": recycle_available(),
-                    "sample": [f["rel"] for f in files[:200]]})
+                # Starts the count; the answer is collected from
+                # /api/upload/scan. See start_scan for why it cannot be
+                # done here.
+                if not start_scan(body.get("plan") or [],
+                                  bool(body.get("skip_hidden", True)),
+                                  bool(body.get("skip_artifacts", True))):
+                    self._send({"error": "already counting those folders"},
+                               409)
+                    return
+                self._send({"started": True})
+                return
+
+            if u.path == "/api/upload/scancancel":
+                scan["cancel"] = True
+                self._send({"ok": True})
                 return
 
             if u.path == "/api/upload/execute":
