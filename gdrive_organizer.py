@@ -4714,9 +4714,29 @@ function showUploadConfirm(d){
   const mode = (document.querySelector('input[name=umode]:checked')||{})
     .value || 'copy';
   const cl = d.clashes || [];
+  const col = d.collisions || [];
   const box = document.getElementById('ovbox');
+  // Two of your own selections landing on the same name in the same Drive
+  // folder — worth saying before the clash block, because the choice
+  // offered there does not fix this one.
+  const colBlock = col.length
+    ? '<div class=card style="border-color:var(--crit)">'+
+      '<strong style="color:var(--crit)">'+col.length+
+      ' name'+(col.length===1?'':'s')+' would end up twice in the same '+
+      'folder</strong>'+
+      '<div class=muted style="margin:6px 0 9px">These are items you '+
+      'chose on this computer, not something already in Drive. Two '+
+      'folders of one name would merge into each other; two files would '+
+      'sit side by side. Send one somewhere else, or rename it '+
+      'first.</div>'+
+      col.map(c=>'<div class=plog style="max-height:120px;margin:6px 0">'+
+        c.paths.map(esc).join('\n')+'\n   →  '+
+        esc(c.target+'/'+c.name)+'</div>').join('')+
+      '</div>'
+    : '';
   box.innerHTML = '<h2 style="margin-top:0">Confirm — upload '+
     d.files.toLocaleString()+' file'+(d.files===1?'':'s')+'</h2>'+
+    colBlock+
     (cl.length
       ? '<div class=card style="border-color:var(--warn)"><strong>'+
         cl.length+' of these already exist'+(cl.length===1?'s':'')+
@@ -4763,9 +4783,10 @@ function showUploadConfirm(d){
         : '<strong>Copy:</strong> nothing on this computer is changed.')+
     '</p>'+
     '<div style="display:flex;gap:9px;margin-top:6px">'+
-    '<button class="btn'+(mode==='move'?' danger':'')+'" id=urunbtn '+
-      'onclick="uploadGo(this,\''+mode+'\')">'+
-      (mode==='move'?'Upload and recycle the originals':'Upload')+
+    '<button class="btn'+(mode==='move'||col.length?' danger':'')+'" '+
+      'id=urunbtn onclick="uploadGo(this,\''+mode+'\')">'+
+      (col.length?'Upload anyway — accept the duplicate name'
+        :mode==='move'?'Upload and recycle the originals':'Upload')+
       '</button>'+
     '<button class="btn ghost" onclick=closeOv()>Cancel</button></div>';
   document.getElementById('ov').classList.add('on');
@@ -7127,6 +7148,24 @@ def run_ui(args) -> None:
             if len(skipped) < 200:
                 skipped.append(entry)
 
+        # Two of the chosen items landing on the same name in the same
+        # Drive folder. Drive permits that, so nothing downstream objects:
+        # the two simply arrive side by side, or merge into one folder,
+        # with no way afterwards to tell which came from where. The
+        # Drive-to-Drive path has always caught this; uploads did not.
+        # Grouped by destination id where one is known, so two folders
+        # that share a path are not treated as one.
+        groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for it in plan:
+            src = it.get("path") or ""
+            nm = it.get("name") or os.path.basename(src)
+            tgt = it.get("target") or ""
+            key = (it.get("targetId") or tgt, nm.lower())
+            groups.setdefault(key, {"target": tgt, "name": nm,
+                                    "paths": []})["paths"].append(src)
+        collisions = [grp for grp in groups.values()
+                      if len(grp["paths"]) > 1]
+
         try:
             for it in plan:
                 if scan["cancel"]:
@@ -7182,7 +7221,8 @@ def run_ui(args) -> None:
                 scan["result"] = {
                     "files": files, "bytes": nbytes,
                     "skipped": skipped, "skipped_total": skipped_total,
-                    "clashes": clashes, "creates": sorted(creates),
+                    "clashes": clashes, "collisions": collisions,
+                    "creates": sorted(creates),
                     # Windows refuses these outright; better to say so now
                     # than to fail two thirds of the way through.
                     "long_paths": long_paths,
