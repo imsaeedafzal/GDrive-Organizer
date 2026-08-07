@@ -1931,6 +1931,36 @@ def docx_to_html(blob: bytes) -> Tuple[str, str]:
     return "".join(parts), "builtin"
 
 
+def zip_listing(blob: bytes) -> Dict[str, Any]:
+    """What is inside an archive, read from its own directory.
+
+    Shared by the Drive and local viewers so an archive is described the
+    same way wherever it came from.
+    """
+    entries = []
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        infos = z.infolist()
+        for info in infos[:MAX_ZIP_ENTRIES]:
+            entries.append({
+                "name": info.filename,
+                "dir": info.is_dir(),
+                "size": info.file_size,
+                "packed": info.compress_size,
+                "date": ("%04d-%02d-%02d" % info.date_time[:3]
+                         if info.date_time[0] >= 1980 else "")})
+        total = len(infos)
+    return {"entries": entries, "total": total,
+            "truncated": total > len(entries),
+            "bytes": sum(e["size"] for e in entries)}
+
+
+def guess_mime(name: str) -> str:
+    """A content type for a local file, from its name."""
+    import mimetypes
+    mime, _ = mimetypes.guess_type(name)
+    return mime or "application/octet-stream"
+
+
 def sanitize_html(raw: str) -> str:
     """Keep only known-safe tags, and no attributes at all.
 
@@ -3553,13 +3583,15 @@ function fileKind(n){
   if(m==='application/vnd.openxmlformats-officedocument.'+
        'wordprocessingml.document' || ext==='docx') return 'doc';
   if(m==='application/msword' || ext==='doc') return 'doc';
+  // Web pages are shown as pages, not as their source.
+  if(m==='text/html' || ext==='html' || ext==='htm') return 'html';
   if(m==='application/zip' || m==='application/x-zip-compressed' ||
      ['zip','jar','war','apk','xpi','epub'].indexOf(ext)>-1) return 'zip';
   if(m.indexOf('text/')===0 || m==='application/json' ||
      m==='application/xml' || TEXT_MIME.indexOf(m)>-1 ||
      ['txt','md','log','csv','json','xml','yml','yaml','ini','env','toml',
       'js','ts','jsx','tsx','py','rb','php','java','c','h','cpp','cs','go',
-      'rs','swift','kt','sh','bat','ps1','sql','css','scss','html','htm',
+      'rs','swift','kt','sh','bat','ps1','sql','css','scss',
       'mjs','cjs','cts','mts','twig','jst','stml','tpl','module','inc',
       'phpt','pl','coffee','cmd','flow','vue','svelte','lua','r','scala',
       'less','sass','styl','map','lock','cfg','conf','properties','po',
@@ -4233,6 +4265,7 @@ function drawClear(){
 // Move is chosen, and then they go to the recycle bin, never straight out.
 const UPLOAD = {};        // local path -> {path,name,folder,target,targetId}
 const LCACHE = {};        // local path -> entries
+const LITEMS = {};        // local path -> the entry itself, for the viewer
 let RECYCLE_OK = true;
 function lsep(p){ return p.indexOf('\\')>-1 ? '\\' : '/'; }
 function lbase(p){
@@ -4244,6 +4277,7 @@ async function lchildren(path){
   if(LCACHE[path]) return LCACHE[path];
   const d = await api('/api/local?path='+encodeURIComponent(path));
   LCACHE[path] = d.items;
+  d.items.forEach(i=>{ LITEMS[i.path] = i; });
   return d.items;
 }
 function lrowHtml(n){
@@ -4254,10 +4288,9 @@ function lrowHtml(n){
   if(n.link) bits.push('<span class="tag stay">link</span>');
   return '<div class=tnode data-path="'+esc(n.path)+'" data-folder="'+
     (n.folder?1:0)+'" data-name="'+esc(n.name)+'">'+
-    '<div class="trow'+(planned?' planned':'')+'">'+
-    '<span class=tw '+(n.folder?'onclick="ltog(this,\''+
-      esc(n.path).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')"':'')+'>'+
-      (n.folder?'&#9656;':'')+'</span>'+
+    '<div class="trow'+(planned?' planned':'')+
+    '" onclick="rowToggle(this,event)">'+
+    '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
     '<span class=ic>'+icon({folder:n.folder, name:n.name, mime:''})+
       '</span>'+
     '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
@@ -4291,8 +4324,19 @@ async function ltog(el, path){
     holder.dataset.loaded='1'; holder.style.display='';
     el.innerHTML='&#9662;';
   }catch(e){
-    el.innerHTML='&#9656;';
-    uiAlert(esc(niceErr(e)), {title:'Could not read that folder'});
+    // Windows keeps plenty of folders unreadable. Saying so in place is
+    // useful; a dialog for each one you happen to click is not.
+    holder.innerHTML = '<div style="padding:5px 8px;font-size:12.5px;'+
+      'color:var(--crit)">'+esc(niceErr(e))+'</div>';
+    holder.dataset.loaded='1'; holder.style.display='';
+    el.innerHTML='&#9662;';
+    const row = el.closest('.trow');
+    if(row && !row.querySelector('.lockedtag')){
+      const tag = document.createElement('span');
+      tag.className = 'tag stay lockedtag';
+      tag.textContent = 'no access';
+      row.insertBefore(tag, row.querySelector('.mt'));
+    }
   }
 }
 async function bootLocal(){
@@ -4558,17 +4602,26 @@ async function dropOn(ev, row){
 
 // One click anywhere on a row: folders expand/collapse, files open a viewer.
 // Clicks on controls (selects, buttons, chips) keep their own behaviour.
+// One row handler for every tree. Which tree a row belongs to decides how
+// it expands and where its preview comes from; nothing else differs.
+function rowSource(row){
+  return row.closest('#ltree') ? 'local' : 'drive';
+}
 function rowToggle(row, ev){
   if(ev && ev.target && ev.target.closest(
       'select,button,input,a,label,.chip')) return;
   const nd = row.closest('.tnode');
   if(!nd) return;
   const tw = row.querySelector(':scope > .tw');
+  const source = rowSource(row);
   if(nd.dataset.folder==='1'){
-    if(row.classList.contains('srow'))
+    if(source==='local') ltog(tw, nd.dataset.path);
+    else if(row.classList.contains('srow'))
       stog(tw, nd.dataset.id, nd.dataset.path);
-    else
-      tog(tw, nd.dataset.id, nd.dataset.path);
+    else tog(tw, nd.dataset.id, nd.dataset.path);
+  } else if(source==='local'){
+    viewItem(LITEMS[nd.dataset.path] ||
+             {path:nd.dataset.path, name:nd.dataset.name}, 'local');
   } else {
     viewFile(nd.dataset.id);
   }
@@ -4613,15 +4666,28 @@ async function copyText(text, btn){
 // Viewer: shows the file itself — images, PDFs (including Docs, Sheets and
 // Slides rendered to PDF), video, audio and text are streamed through this
 // server, which already holds the Drive credentials.
-function fileUrl(id){
-  return '/api/file?t='+encodeURIComponent(TOKEN)+
-         '&id='+encodeURIComponent(id);
+// One viewer for both trees. `source` is 'drive' or 'local'; everything
+// below is written against the item, not against where it came from.
+function fileUrl(it, source){
+  return source==='local'
+    ? '/api/localfile?t='+encodeURIComponent(TOKEN)+
+      '&path='+encodeURIComponent(it.path)
+    : '/api/file?t='+encodeURIComponent(TOKEN)+
+      '&id='+encodeURIComponent(it.id);
 }
-function viewFile(id){
-  const it = findItem(id);
+function apiUrlFor(kind, it, source){
+  const key = source==='local'
+    ? 'path='+encodeURIComponent(it.path)
+    : 'id='+encodeURIComponent(it.id);
+  if(kind==='doc') return (source==='local'?'/api/localdoc?':'/api/doc?')+key;
+  return (source==='local'?'/api/localzip?':'/api/zip?')+key;
+}
+function viewFile(id){ const it = findItem(id); if(it) viewItem(it,'drive'); }
+function viewItem(it, source){
   if(!it) return;
+  source = source || 'drive';
   const kind = fileKind(it);
-  const url = fileUrl(it.id);
+  const url = fileUrl(it, source);
   const box = document.getElementById('ovbox');
   const head = '<h2 style="margin-top:0;overflow-wrap:anywhere">'+
     icon(it)+' '+esc(it.name)+'</h2>'+
@@ -4633,6 +4699,8 @@ function viewFile(id){
     '<div style="display:flex;gap:9px;margin-top:12px;flex-wrap:wrap">'+
     (it.link?'<a class=btn target=_blank rel=noopener href="'+esc(it.link)+
       '">Open in Drive</a>':'')+
+    (source==='local'?'<a class="btn ghost" target=_blank href="'+url+
+      '">Open in a tab</a>':'')+
     (it.link?'<button class="btn ghost" onclick="copyText(\''+
       esc(it.link).replace(/'/g,"\\'")+'\',this)">Copy link</button>':'')+
     '<button class="btn ghost" onclick="copyText(\''+
@@ -4664,23 +4732,33 @@ function viewFile(id){
   } else if(kind==='doc'){
     body = '<div id=vdoc class=vdoc><span class=spin></span> '+
       'reading the document&hellip;</div>';
+  } else if(kind==='html'){
+    // Rendered as a page, inside a sandbox with nothing enabled: no
+    // scripts, no forms, no access back to this page. Anything the file
+    // pulls in from elsewhere simply will not load, which is the point.
+    body = '<iframe class=vframe sandbox src="'+url+'" title="'+
+      esc(it.name)+'"></iframe>'+
+      '<p class=muted style="font-size:12px">Shown as a page with '+
+      'scripts disabled. Images or stylesheets it links to are not '+
+      'loaded.</p>';
   } else {
     body = '<p class=muted>No inline preview for this file type — '+
-      'open it in Drive or download it.</p>';
+      (source==='local'?'open it on your computer'
+                       :'open it in Drive')+' or download it.</p>';
   }
   box.innerHTML = head + body + actions;
   document.getElementById('ov').classList.add('on');
   if(kind==='text') loadText(url);
-  if(kind==='zip') loadZip(it.id);
-  if(kind==='doc') loadDoc(it.id);
+  if(kind==='zip') loadZip(apiUrlFor('zip', it, source));
+  if(kind==='doc') loadDoc(apiUrlFor('doc', it, source));
 }
 // Word documents, converted on the server and filtered down to a small
 // set of safe tags before being placed in the page.
-async function loadDoc(id){
+async function loadDoc(url){
   const host = document.getElementById('vdoc');
   if(!host) return;
   let d;
-  try{ d = await api('/api/doc?id='+encodeURIComponent(id)); }
+  try{ d = await api(url); }
   catch(e){
     const raw = String(e);
     const legacy = raw.indexOf('older binary')>-1;
@@ -4698,11 +4776,11 @@ async function loadDoc(id){
 }
 // Archive contents, read from the zip's own directory — nothing is
 // extracted and nothing is written to disk.
-async function loadZip(id){
+async function loadZip(url){
   const host = document.getElementById('vzip');
   if(!host) return;
   let d;
-  try{ d = await api('/api/zip?id='+encodeURIComponent(id)); }
+  try{ d = await api(url); }
   catch(e){
     host.innerHTML = '<span class=muted>Could not read the archive: '+
       esc(niceErr(e))+'</span>';
@@ -7256,6 +7334,82 @@ def run_ui(args) -> None:
                 self._send({"items": items, "path": os.path.abspath(path)})
                 return
 
+            if u.path in ("/api/localfile", "/api/localdoc",
+                          "/api/localzip"):
+                # The local half of the viewer. Same shapes as the Drive
+                # endpoints so one set of client code renders both.
+                q = urllib.parse.parse_qs(u.query)
+                if u.path == "/api/localfile":
+                    # <img>/<iframe> cannot send headers, so this one
+                    # authenticates on the query token like /api/file.
+                    if not self._local() or (
+                            q.get("t") or [""])[0] != auth:
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                elif not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                path = (q.get("path") or [""])[0]
+                if not path or not os.path.isfile(_long(path)):
+                    self._send({"error": "not a file on this computer"}, 400)
+                    return
+                try:
+                    size = os.path.getsize(_long(path))
+                    if size > MAX_PREVIEW_BYTES and u.path != "/api/localzip":
+                        self._send({"error": f"{human(size)} is over the "
+                                             f"{human(MAX_PREVIEW_BYTES)} "
+                                             f"preview limit"}, 413)
+                        return
+                    if u.path == "/api/localzip" and size > MAX_ZIP_BYTES:
+                        self._send({"error": f"{human(size)} is over the "
+                                             f"{human(MAX_ZIP_BYTES)} "
+                                             f"listing limit"}, 413)
+                        return
+                    with open(_long(path), "rb") as fh:
+                        blob = fh.read()
+                except PermissionError:
+                    self._send({"error": "permission denied"}, 403)
+                    return
+                except OSError as err:
+                    self._send({"error": str(err)}, 500)
+                    return
+                name = os.path.basename(path)
+                if u.path == "/api/localdoc":
+                    if not name.lower().endswith(".docx"):
+                        self._send({
+                            "error": "This is the older binary .doc "
+                                     "format, which cannot be read here.",
+                            "legacy": True}, 415)
+                        return
+                    try:
+                        body, engine = docx_to_html(blob)
+                    except zipfile.BadZipFile:
+                        self._send({"error": "this .docx could not be read "
+                                             "— it may be corrupt"}, 415)
+                        return
+                    clean = sanitize_html(body)
+                    self._send({"html": clean, "engine": engine,
+                                "empty": not clean.strip()})
+                    return
+                if u.path == "/api/localzip":
+                    try:
+                        listing = zip_listing(blob)
+                    except zipfile.BadZipFile:
+                        self._send({"error": "not a readable zip archive"},
+                                   415)
+                        return
+                    listing["name"] = name
+                    self._send(listing)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", guess_mime(name))
+                self.send_header("Content-Length", str(len(blob)))
+                self.send_header("Content-Disposition", "inline")
+                self.end_headers()
+                self.wfile.write(blob)
+                return
+
             if u.path == "/api/doc":
                 if not self._authed():
                     self._send({"error": "forbidden"}, 403)
@@ -7327,18 +7481,7 @@ def run_ui(args) -> None:
                     with api_lock:
                         blob = with_backoff(service.files().get_media(
                             fileId=fid).execute)
-                    entries = []
-                    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-                        for info in z.infolist()[:MAX_ZIP_ENTRIES]:
-                            entries.append({
-                                "name": info.filename,
-                                "dir": info.is_dir(),
-                                "size": info.file_size,
-                                "packed": info.compress_size,
-                                "date": ("%04d-%02d-%02d" % info.date_time[:3]
-                                         if info.date_time[0] >= 1980
-                                         else "")})
-                        total = len(z.infolist())
+                    listing = zip_listing(blob)
                 except zipfile.BadZipFile:
                     self._send({"error": "not a readable zip archive"}, 415)
                     return
@@ -7346,10 +7489,8 @@ def run_ui(args) -> None:
                     self._send({"error": f"{type(err).__name__}: {err}"},
                                500)
                     return
-                self._send({"name": meta.get("name", ""), "entries": entries,
-                            "total": total,
-                            "truncated": total > len(entries),
-                            "bytes": sum(e["size"] for e in entries)})
+                listing["name"] = meta.get("name", "")
+                self._send(listing)
                 return
 
             if u.path == "/api/file":
