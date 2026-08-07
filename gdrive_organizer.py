@@ -2490,6 +2490,9 @@ def run_undo(args) -> None:
 
 REVIEW_PAGE = """<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
+<!-- This page's URL carries the session token; never hand it to a site
+     we link out to. -->
+<meta name=referrer content=no-referrer>
 <title>Quarantined duplicates</title><style>__CSS__
 .item{background:var(--surface);border:1px solid var(--ring);border-radius:11px;
 padding:14px 16px;margin:10px 0}
@@ -2534,9 +2537,10 @@ function draw(){
     '<div class=orig>quarantined from <code>'+esc(it.from)+'</code></div>'+
     '<div class=orig>original kept at <code>'+esc(it.original)+'</code></div>'+
     '<div class=acts>'+
-    (it.link?'<a class="btn ghost" target=_blank href="'+esc(it.link)+
-      '">Open in Drive</a>':'')+
-    (it.original_link?'<a class="btn ghost" target=_blank href="'+
+    (it.link?'<a class="btn ghost" target=_blank rel="noopener noreferrer" '+
+      'href="'+esc(it.link)+'">Open in Drive</a>':'')+
+    (it.original_link?'<a class="btn ghost" target=_blank '+
+      'rel="noopener noreferrer" href="'+
       esc(it.original_link)+'">Open the original</a>':'')+
     '<button class="btn danger" onclick="trash('+i+')">Move to trash</button>'+
     '<span id=s'+i+'></span></div></div>').join('');
@@ -2902,6 +2906,10 @@ def cmd_verify(args) -> None:
 
 UI_HTML = r"""<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
+<!-- The page URL carries the session token, and that token can read any
+     file this computer can. Without this, following a link to Drive hands
+     the whole URL to Google in the Referer header. -->
+<meta name=referrer content=no-referrer>
 <title>Organise Drive</title><style>__CSS__
 html,body{overflow-x:hidden}
 .app{display:grid;grid-template-columns:1fr 340px;gap:18px;align-items:start}
@@ -4879,10 +4887,10 @@ function viewItem(it, source){
     (it.modified?' &middot; modified '+esc(it.modified):'')+'</p>';
   const actions =
     '<div style="display:flex;gap:9px;margin-top:12px;flex-wrap:wrap">'+
-    (it.link?'<a class=btn target=_blank rel=noopener href="'+esc(it.link)+
-      '">Open in Drive</a>':'')+
-    (source==='local'?'<a class="btn ghost" target=_blank href="'+url+
-      '">Open in a tab</a>':'')+
+    (it.link?'<a class=btn target=_blank rel="noopener noreferrer" href="'+
+      esc(it.link)+'">Open in Drive</a>':'')+
+    (source==='local'?'<a class="btn ghost" target=_blank '+
+      'rel="noopener noreferrer" href="'+url+'">Open in a tab</a>':'')+
     (it.link?'<button class="btn ghost" onclick="copyText(\''+
       esc(it.link).replace(/'/g,"\\'")+'\',this)">Copy link</button>':'')+
     '<button class="btn ghost" onclick="copyText(\''+
@@ -7154,12 +7162,14 @@ def run_ui(args) -> None:
         Runs on its own API client: a multi-gigabyte upload would otherwise
         hold the shared lock and freeze browsing for the whole transfer.
         """
-        from googleapiclient.http import MediaFileUpload
         # The caller claimed the job and cleared the last run's state. The
-        # try/finally covers everything from here, including opening the
-        # log: a failure on the way in must still hand the job back.
+        # try/finally covers everything from here, including the import and
+        # opening the log: a failure on the way in must still hand the job
+        # back, or the interface refuses every later run as "already in
+        # progress" with nothing running.
         uploaded_ok: List[Tuple[str, str]] = []
         try:
+            from googleapiclient.http import MediaFileUpload
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             os.makedirs(LOG_DIR, exist_ok=True)
             job.undo_log = os.path.abspath(
