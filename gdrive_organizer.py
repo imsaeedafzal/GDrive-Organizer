@@ -1739,7 +1739,12 @@ def send_to_recycle_bin(path: str) -> None:
                  | FOF_SILENT)
     res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
     if res != 0 or op.fAnyOperationsAborted:
-        raise RuntimeError(f"could not recycle (code {res})")
+        why = {32: "it is open in another program",
+               5: "access was denied",
+               2: "it is no longer there",
+               0x7C: "the path is too long for Windows"}.get(
+                   res, f"Windows returned code {res}")
+        raise RuntimeError(why)
 
 
 def local_entries(path: str) -> List[Dict[str, Any]]:
@@ -7111,6 +7116,8 @@ def run_ui(args) -> None:
                         break
                     job.current = unit["rel"]
                     job.pct = 0
+                    media = None
+                    req = None
                     try:
                         base = unit["targetId"] or upfolders.resolve(
                             unit["target"])
@@ -7184,6 +7191,22 @@ def run_ui(args) -> None:
                         msg = f"FAILED {unit['rel']}: {err}"
                         job.errors.append(msg)
                         job.log.append(msg)
+                    finally:
+                        # The uploader holds the file open. Left open, the
+                        # last file of a run is still locked when Move
+                        # tries to recycle it, and Windows refuses with a
+                        # sharing violation.
+                        try:
+                            if media is not None:
+                                closer = getattr(media, "close", None)
+                                if callable(closer):
+                                    closer()
+                                elif getattr(media, "_fd", None):
+                                    media._fd.close()
+                        except Exception:
+                            pass
+                        media = None
+                        req = None
                     job.done += 1
                     job.pct = 0
 
@@ -7206,7 +7229,15 @@ def run_ui(args) -> None:
                                     f"kept {src} — the copy in Drive does "
                                     f"not match")
                                 continue
-                            send_to_recycle_bin(src)
+                            try:
+                                send_to_recycle_bin(src)
+                            except Exception:
+                                # A virus scanner or search indexer often
+                                # holds a just-written file for a moment.
+                                # One patient retry settles that; a real
+                                # lock still reports below.
+                                time.sleep(1.5)
+                                send_to_recycle_bin(src)
                             log.write(json.dumps({
                                 "op": "local_recycle", "path": src,
                                 "drive_id": fid,
