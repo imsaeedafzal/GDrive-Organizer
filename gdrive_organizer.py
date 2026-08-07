@@ -2399,6 +2399,12 @@ def run_undo(args) -> None:
                     ok += 1
                 else:
                     ok += 1
+            elif rec.get("op") == "local_rename":
+                # Purely a filesystem change, so it reverses without Drive.
+                back, cur = rec.get("from", ""), rec.get("path", "")
+                if args.execute and back and os.path.exists(cur):
+                    os.rename(cur, back)
+                ok += 1
             elif rec.get("op") == "local_recycle":
                 # Nothing to do in Drive, and restoring from the recycle
                 # bin is the operating system's job — say so rather than
@@ -3710,48 +3716,85 @@ function ancestorPlanned(path){
 function plannedFor(nd){
   return nd && nd.dataset ? PLAN[nd.dataset.id] : null;
 }
+// ---- one row, four trees --------------------------------------------------
+// Every tree row has the same anatomy: a toggle, an icon, a name, some
+// tags, some stats, some actions and a trailing control. The trees differ
+// only in what goes in those slots, so they fill in a shell rather than
+// each building their own markup.
+function q(s){ return String(s==null?'':s).replace(/'/g,"\\'"); }
+function rowShell(n, o){
+  o = o || {};
+  const cls = (o.rowClass || 'trow') + (o.cls ? ' '+o.cls : '');
+  const drag = o.drag===false ? '' :
+    ' draggable=true ondragstart="dragStart(event,this)"'+
+    ' ondragend="dragEnd(this)"' +
+    (n.folder && o.drop!==false
+      ? ' ondragover="dragOver(event,this)" ondragleave="dragLeave(this)"'+
+        ' ondrop="dropOn(event,this)"' : '');
+  return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
+    esc(n.id||'')+'" data-folder="'+(n.folder?1:0)+'" data-name="'+
+    esc(n.name)+'"'+(o.attrs||'')+'>'+
+    '<div class="'+cls+'" onclick="rowToggle(this,event)"'+drag+'>'+
+    '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
+    '<span class=ic>'+icon(n)+'</span>'+
+    '<span class=nm title="'+esc(o.title||n.path||n.name)+'">'+
+      esc(n.name)+(o.sub?' <span class=hint>'+esc(o.sub)+'</span>':'')+
+      '</span>'+
+    (o.tags||[]).join('')+
+    (o.actions||[]).join('')+
+    '<span class=mt'+(o.statTitle||'')+'>'+esc(o.stats||'')+'</span>'+
+    (o.trail||'')+
+    '</div>'+(o.kids===false?'':'<div class=kids style="display:none">'+
+      '</div>')+'</div>';
+}
+// The two actions every tree offers on a real item. `source` picks which
+// implementation runs; the button is identical either way.
+function renameBtn(n, source){
+  const ref = source==='local' ? q(n.path) : q(n.id||'');
+  return '<button class=rowx title="rename" onclick="event.stopPropagation();'+
+    (source==='local'?'renameLocal':'renameItem')+"('"+ref+"','"+
+    q(n.name)+"',"+(n.folder?1:0)+',this)">&#9998;</button>';
+}
+function trashBtn(n, source){
+  const ref = source==='local' ? q(n.path) : q(n.id||'');
+  return '<button class=rowx title="'+
+    (source==='local'?'move to the recycle bin':'move to Drive trash')+
+    '" onclick="event.stopPropagation();'+
+    (source==='local'?'trashLocal':'trashItem')+"('"+ref+"','"+
+    q(n.name)+"',"+(n.folder?1:0)+',this)">&#128465;</button>';
+}
+function driveStats(n){
+  return (n.files!=null? n.files.toLocaleString()+' files':'') +
+    (n.bytes? ' · '+human(n.bytes):'') +
+    (!n.folder && n.size? human(n.size):'');
+}
 function rowHtml(n){
   const planned = PLAN[n.id];
   const anc = ancestorPlanned(n.path);
-  const stats = (n.files!=null? n.files.toLocaleString()+' files':'') +
-    (n.bytes? ' · '+human(n.bytes):'') +
-    (!n.folder && n.size? human(n.size):'');
-  const statTitle = (n.folder && n.files!=null)
-    ? (n.live_totals
-       ? ' title="everything inside this folder, counted from your Drive '+
-         'as it is now"'
-       : ' title="from your last scan — may be out of date if things have '+
-         'moved since"')
-    : '';
-  return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
-    esc(n.id)+'" data-folder="'+(n.folder?1:0)+'" data-name="'+
-    esc(n.name)+'">'+
-    '<div class="trow'+(planned?' planned':(anc?' carried':''))+
-    '" onclick="rowToggle(this,event)" draggable=true'+
-    ' ondragstart="dragStart(event,this)" ondragend="dragEnd(this)"'+
-    (n.folder?' ondragover="dragOver(event,this)"'+
-      ' ondragleave="dragLeave(this)" ondrop="dropOn(event,this)"':'')+'>'+
-    '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
-    '<span class=ic>'+icon(n)+'</span>'+
-    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
-    (n.owned===false?'<span class="tag stay" title="owned by someone else — '+
-      'moving it changes what they see, and Drive may refuse">not yours'+
-      '</span>':'')+
-    (n.shared&&n.owned!==false?'<span class="tag stay">shared</span>':'')+
-    (n.folder&&n.empty?'<span class="tag stay emptytag">empty</span>':'')+
-    '<button class=rowx title="rename" '+
-    'onclick="event.stopPropagation();renameItem(\''+esc(n.id)+'\',\''+
-    esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
-    ',this)">&#9998;</button>'+
-    '<button class=rowx title="move to Drive trash" '+
-    'onclick="event.stopPropagation();trashItem(\''+esc(n.id)+'\',\''+
-    esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
-    ',this)">&#128465;</button>'+
-    '<span class=mt'+statTitle+'>'+esc(stats)+'</span>'+
-    (anc? '<span class="tag stay">moves with '+esc(anc.split('/').pop())+
-      '</span>'
-     : destBtn(n.path, n.id, n.name, planned?planned.target:''))+
-    '</div><div class=kids style="display:none"></div></div>';
+  const tags = [];
+  if(n.owned===false) tags.push('<span class="tag stay" title="owned by '+
+    'someone else — moving it changes what they see, and Drive may '+
+    'refuse">not yours</span>');
+  if(n.shared && n.owned!==false)
+    tags.push('<span class="tag stay">shared</span>');
+  if(n.folder && n.empty)
+    tags.push('<span class="tag stay emptytag">empty</span>');
+  return rowShell(n, {
+    cls: planned ? 'planned' : (anc ? 'carried' : ''),
+    tags: tags,
+    actions: [renameBtn(n,'drive'), trashBtn(n,'drive')],
+    stats: driveStats(n),
+    statTitle: (n.folder && n.files!=null)
+      ? (n.live_totals
+         ? ' title="everything inside this folder, counted from your '+
+           'Drive as it is now"'
+         : ' title="from your last scan — may be out of date if things '+
+           'have moved since"')
+      : '',
+    trail: anc
+      ? '<span class="tag stay">moves with '+esc(anc.split('/').pop())+
+        '</span>'
+      : destBtn(n.path, n.id, n.name, planned?planned.target:'')});
 }
 // ---- destination picker ---------------------------------------------------
 // A searchable popup rather than a <select>: the destination list grows with
@@ -4291,30 +4334,18 @@ async function runSearch(){
 }
 function resultRow(n){
   const planned = PLAN[n.id];
-  const stats = (n.files!=null ? n.files.toLocaleString()+' files' : '') +
-    (n.bytes ? ' · '+human(n.bytes) : '') +
-    (!n.folder && n.size ? human(n.size) : '');
-  return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
-    esc(n.id)+'" data-folder="'+(n.folder?1:0)+'" data-name="'+
-    esc(n.name)+'">'+
-    '<div class="trow'+(planned?' planned':'')+'" draggable=true '+
-    'ondragstart="dragStart(event,this)" ondragend="dragEnd(this)">'+
-    '<span class=tw></span><span class=ic>'+icon(n)+'</span>'+
-    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+
-    '<span class=hint style="margin-left:7px">'+
-    esc(n.parentPath||'My Drive')+'</span></span>'+
-    (n.shared?'<span class="tag stay">shared</span>':'')+
-    '<span class=mt>'+esc(stats)+'</span>'+
-    '<button class=rowx title="show where this lives" onclick="revealPath('+
-    '\''+esc(n.path).replace(/'/g,"\\'")+'\',true)">&#128269;</button>'+
-    '<button class=rowx title="rename" onclick="renameItem(\''+esc(n.id)+
-    '\',\''+esc(n.name).replace(/'/g,"\\'")+'\','+(n.folder?1:0)+
-    ',this)">&#9998;</button>'+
-    '<button class=rowx title="move to Drive trash" onclick="trashItem(\''+
-    esc(n.id)+'\',\''+esc(n.name).replace(/'/g,"\\'")+'\','+
-    (n.folder?1:0)+',this)">&#128465;</button>'+
-    destBtn(n.path, n.id, n.name, planned?planned.target:'')+
-    '</div></div>';
+  return rowShell(n, {
+    cls: planned ? 'planned' : '',
+    drop: false,                 // a result is not a place to drop onto
+    kids: false,                 // results are flat
+    sub: n.parentPath || 'My Drive',
+    tags: n.shared ? ['<span class="tag stay">shared</span>'] : [],
+    actions: ['<button class=rowx title="show where this lives" '+
+      "onclick=\"event.stopPropagation();revealPath('"+q(n.path)+
+      "',true)\">&#128269;</button>",
+      renameBtn(n,'drive'), trashBtn(n,'drive')],
+    stats: driveStats(n),
+    trail: destBtn(n.path, n.id, n.name, planned?planned.target:'')});
 }
 function closeSearch(){
   document.getElementById('results').style.display = 'none';
@@ -4365,23 +4396,19 @@ async function lchildren(path){
 }
 function lrowHtml(n){
   const planned = UPLOAD[n.path];
-  const bits = [];
-  if(n.folder && n.artifact) bits.push('<span class="tag stay">build</span>');
-  if(n.hidden) bits.push('<span class="tag stay">hidden</span>');
-  if(n.link) bits.push('<span class="tag stay">link</span>');
-  return '<div class=tnode data-path="'+esc(n.path)+'" data-folder="'+
-    (n.folder?1:0)+'" data-name="'+esc(n.name)+'">'+
-    '<div class="trow'+(planned?' planned':'')+
-    '" onclick="rowToggle(this,event)">'+
-    '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
-    '<span class=ic>'+icon({folder:n.folder, name:n.name, mime:''})+
-      '</span>'+
-    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
-    bits.join('')+
-    '<span class=mt>'+(n.size?human(n.size):'')+
-      (n.modified?' &middot; '+esc(n.modified):'')+'</span>'+
-    uploadBtn(n.path, n.name, n.folder, planned?planned.target:'')+
-    '</div><div class=kids style="display:none"></div></div>';
+  const tags = [];
+  if(n.folder && n.artifact) tags.push('<span class="tag stay">build</span>');
+  if(n.hidden) tags.push('<span class="tag stay">hidden</span>');
+  if(n.link) tags.push('<span class="tag stay">link</span>');
+  return rowShell(n, {
+    cls: planned ? 'planned' : '',
+    drag: false,                 // nothing to drag onto in this tree
+    tags: tags,
+    actions: [renameBtn(n,'local'), trashBtn(n,'local')],
+    stats: (n.size?human(n.size):'') +
+           (n.modified?' · '+n.modified:''),
+    trail: uploadBtn(n.path, n.name, n.folder,
+                     planned?planned.target:'')});
 }
 function uploadBtn(path, name, folder, cur){
   const label = cur ? cur : 'leave on this PC';
@@ -4448,6 +4475,68 @@ async function bootLocal(){
   lt.innerHTML = d.roots.map(r=>lrowHtml(
     {name:r.name, path:r.path, folder:true, size:0, modified:''})).join('');
   drawUploads();
+}
+// The same two actions the Drive tree offers, on this computer. Deleting
+// goes to the recycle bin, never straight out — the same promise the rest
+// of the tool makes.
+async function renameLocal(path, name, isFolder, btn){
+  const next = await uiPrompt(
+    'New name for '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b>:',
+    name, {title:'Rename on this computer', yes:'Rename'});
+  if(!next || next===name) return;
+  const undo = busy(btn);
+  let d;
+  try{ d = await api('/api/localrename',{path:path, name:next}); }
+  catch(e){
+    undo();
+    uiAlert(esc(niceErr(e)), {title:'Could not rename'});
+    return;
+  }
+  // Anything planned under the old path has to follow it.
+  const moved = d.path;
+  Object.keys(UPLOAD).forEach(k=>{
+    if(k===path || k.indexOf(path+'\\')===0 || k.indexOf(path+'/')===0){
+      const rec = UPLOAD[k];
+      delete UPLOAD[k];
+      rec.path = moved + k.slice(path.length);
+      if(k===path) rec.name = next;
+      UPLOAD[rec.path] = rec;
+    }
+  });
+  Object.keys(LCACHE).forEach(k=>{ delete LCACHE[k]; });
+  await refreshLocal();
+  drawUploads();
+}
+async function trashLocal(path, name, isFolder, btn){
+  const ok = await uiConfirm(
+    'Move '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b> to the '+
+    'recycle bin?'+
+    (isFolder?'<br><br><b>Everything inside goes with it.</b>':'')+
+    '<br><br><span class=muted>It is not deleted — Windows keeps it in '+
+    'the recycle bin, where you can put it back. Nothing in Drive '+
+    'changes.</span>',
+    {title:'Move to the recycle bin', yes:'Move to recycle bin',
+     danger:true});
+  if(!ok) return;
+  const undo = busy(btn);
+  try{ await api('/api/localtrash',{path:path}); }
+  catch(e){
+    undo();
+    uiAlert(esc(niceErr(e)), {title:'Could not remove it'});
+    return;
+  }
+  const nd = btn.closest('.tnode');
+  if(nd) nd.remove();
+  delete UPLOAD[path];
+  Object.keys(LCACHE).forEach(k=>{
+    LCACHE[k] = LCACHE[k].filter(i=>i.path!==path); });
+  delete LITEMS[path];
+  drawUploads();
+}
+async function refreshLocal(){
+  Object.keys(LCACHE).forEach(k=>{ delete LCACHE[k]; });
+  document.getElementById('ltree').dataset.loaded = '';
+  await bootLocal();
 }
 function openUploadPicker(ev, path, name, folder){
   ev.stopPropagation();
@@ -5287,18 +5376,15 @@ async function showPerson(who){
     d.items.map(it=>{
       const p = (it.perms||[]).find(x=>(x.email||x.domain||
         (x.type==='anyone'?'Anyone with the link':x.type))===who);
-      return '<div class=tnode data-path="'+esc(it.path)+'" data-id="'+
-        esc(it.id)+'" data-folder="'+(it.folder?1:0)+'" data-shared="1">'+
-        '<div class=srow onclick="rowToggle(this,event)">'+
-        '<span class=tw></span><span class=ic>'+icon(it)+'</span>'+
-        '<span class=nm title="'+esc(it.path)+'">'+esc(it.name)+
-        '<span class=hint style="margin-left:7px">'+
-        esc(parentOf(it.path)||'My Drive')+'</span></span>'+
-        (it.public?'<span class="tag stay" style="color:var(--crit)">'+
-          'public</span>':'')+
-        (p?'<span class=perms>'+permChip(it.id,p,it.can_share!==false)+
-          '</span>':'')+
-        '</div></div>';
+      return rowShell(it, {
+        rowClass: 'srow', drag: false, kids: false,
+        attrs: ' data-shared="1"',
+        sub: parentOf(it.path) || 'My Drive',
+        tags: it.public
+          ? ['<span class="tag stay" style="color:var(--crit)">public'+
+             '</span>'] : [],
+        trail: p ? '<span class=perms>'+
+          permChip(it.id, p, it.can_share!==false)+'</span>' : ''});
     }).join('')+
     (d.total>d.items.length
       ? '<div class=muted style="padding:8px">showing the first '+
@@ -5363,23 +5449,22 @@ function permChip(fid,p,canManage){
 function srowHtml(n){
   const canManage = n.can_share !== false && n.owned !== false;
   const chips = (n.perms||[]).map(p=>permChip(n.id,p,canManage)).join('');
-  return '<div class=tnode data-path="'+esc(n.path)+'" data-id="'+
-    esc(n.id)+'" data-shared="'+(n.shared?1:0)+'" data-folder="'+
-    (n.folder?1:0)+'" data-sharedin="'+(n.shared_inside||0)+'">'+
-    '<div class=srow onclick="rowToggle(this,event)">'+
-    '<span class=tw>'+(n.folder?'&#9656;':'')+'</span>'+
-    '<span class=ic>'+icon(n)+'</span>'+
-    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
-    (n.owned===false?'<span class="tag stay">not yours</span>':'')+
-    (n.folder&&n.empty?'<span class="tag stay">empty</span>':'')+
-    (n.folder&&n.shared_inside?'<span class="tag sharedin" title="shared '+
-      'items anywhere beneath this folder — follow the trail down">'+
-      n.shared_inside.toLocaleString()+' shared inside</span>':'')+
-    '<span class=perms>'+
+  const tags = [];
+  if(n.owned===false) tags.push('<span class="tag stay">not yours</span>');
+  if(n.folder && n.empty) tags.push('<span class="tag stay">empty</span>');
+  if(n.folder && n.shared_inside)
+    tags.push('<span class="tag sharedin" title="shared items anywhere '+
+      'beneath this folder — follow the trail down">'+
+      n.shared_inside.toLocaleString()+' shared inside</span>');
+  return rowShell(n, {
+    rowClass: 'srow',
+    drag: false,
+    attrs: ' data-shared="'+(n.shared?1:0)+'" data-sharedin="'+
+           (n.shared_inside||0)+'"',
+    tags: tags,
+    trail: '<span class=perms>'+
       (n.shared ? (chips||'<span class=muted style="font-size:12px">'+
-        'shared</span>') : '')+
-    '</span>'+
-    '</div><div class=kids style="display:none"></div></div>';
+        'shared</span>') : '')+'</span>'});
 }
 async function bootShare(){
   const st = document.getElementById('stree');
@@ -5578,6 +5663,7 @@ async function refreshActive(btn){
   try{
     if(VIEW==='share') await refreshShare();
     else if(VIEW==='trash') await refreshTrash();
+    else if(VIEW==='local') await refreshLocal();
     else await refreshTree();
   } finally { done(); }
 }
@@ -8162,6 +8248,49 @@ def run_ui(args) -> None:
                             timespec="seconds")}) + "\n")
                 schedule_reindex()      # it is a real folder again
                 self._send({"ok": True})
+                return
+
+            if u.path in ("/api/localrename", "/api/localtrash"):
+                # The same two actions the Drive tree offers, for files on
+                # this computer. Deleting goes to the recycle bin, exactly
+                # as Move does — nothing here removes anything outright.
+                path = (body.get("path") or "").strip()
+                if not path or not os.path.exists(_long(path)):
+                    self._send({"error": "that is no longer on this "
+                                         "computer"}, 400)
+                    return
+                try:
+                    if u.path == "/api/localtrash":
+                        send_to_recycle_bin(path)
+                        rec = {"op": "local_recycle", "path": path}
+                    else:
+                        new = (body.get("name") or "").strip()
+                        if not new or "/" in new or "\\" in new:
+                            self._send({"error": "a name cannot contain a "
+                                                 "slash"}, 400)
+                            return
+                        dest = os.path.join(os.path.dirname(path), new)
+                        if os.path.exists(_long(dest)):
+                            self._send({"error": f"'{new}' already exists "
+                                                 f"in that folder"}, 400)
+                            return
+                        os.rename(_long(path), _long(dest))
+                        rec = {"op": "local_rename", "path": dest,
+                               "from": path}
+                except PermissionError:
+                    self._send({"error": "Windows would not allow that — "
+                                         "the file may be open"}, 403)
+                    return
+                except OSError as err:
+                    self._send({"error": str(err)}, 500)
+                    return
+                os.makedirs(LOG_DIR, exist_ok=True)
+                rec["at"] = datetime.now().isoformat(timespec="seconds")
+                with open(os.path.join(LOG_DIR, "local_actions.jsonl"),
+                          "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec) + "\n")
+                self._send({"ok": True,
+                            "path": rec.get("path", path)})
                 return
 
             if u.path == "/api/upload/preview":
