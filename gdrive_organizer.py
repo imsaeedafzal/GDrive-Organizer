@@ -1747,6 +1747,20 @@ def send_to_recycle_bin(path: str) -> None:
         raise RuntimeError(why)
 
 
+def local_md5(path: str) -> str:
+    """The file's MD5, read in chunks so size is not a constraint.
+
+    Drive reports the same for anything uploaded, which is what lets a
+    local original be deleted on proof rather than on a size match.
+    """
+    import hashlib
+    h = hashlib.md5()
+    with open(_long(path), "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def local_entries(path: str) -> List[Dict[str, Any]]:
     """One directory listing, folders first, with sizes where cheap."""
     out: List[Dict[str, Any]] = []
@@ -7210,8 +7224,10 @@ def run_ui(args) -> None:
                     job.done += 1
                     job.pct = 0
 
-                # Only now, and only for uploads confirmed present in
-                # Drive at the right size, is anything local touched.
+                # Only now, and only where the copy in Drive is proved
+                # identical, is anything local touched. Matching lengths
+                # are not proof — two different files can share a size —
+                # so the content is compared by checksum.
                 if mode == "move" and uploaded_ok:
                     job.current = "checking uploads before removing "\
                                   "originals"
@@ -7219,15 +7235,33 @@ def run_ui(args) -> None:
                     for fid, src in uploaded_ok:
                         try:
                             meta = with_backoff(up.files().get(
-                                fileId=fid, fields="id,size,trashed"
+                                fileId=fid,
+                                fields="id,size,trashed,md5Checksum"
                             ).execute)
                             local_size = os.path.getsize(_long(src))
-                            if meta.get("trashed") or (
-                                    int(meta.get("size") or -1)
-                                    != local_size):
+                            remote_md5 = meta.get("md5Checksum") or ""
+                            if meta.get("trashed"):
                                 job.errors.append(
-                                    f"kept {src} — the copy in Drive does "
-                                    f"not match")
+                                    f"kept {src} — the copy in Drive is in "
+                                    f"the trash")
+                                continue
+                            if int(meta.get("size") or -1) != local_size:
+                                job.errors.append(
+                                    f"kept {src} — the copy in Drive is a "
+                                    f"different size")
+                                continue
+                            if not remote_md5:
+                                # No checksum to compare against, so the
+                                # copy cannot be proved identical. Keeping
+                                # the original is the only honest choice.
+                                job.errors.append(
+                                    f"kept {src} — Drive gave no checksum "
+                                    f"to verify the copy against")
+                                continue
+                            if local_md5(src) != remote_md5:
+                                job.errors.append(
+                                    f"kept {src} — the copy in Drive has "
+                                    f"different contents")
                                 continue
                             try:
                                 send_to_recycle_bin(src)
