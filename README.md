@@ -99,9 +99,14 @@ aren't required to have one.
 
 **Click any file to view it.** Images, PDFs, video, audio and text or code
 files are streamed through the local server and shown inline, and Google
-Docs, Sheets and Slides are rendered to PDF for preview. **ZIP archives
-list their contents** — read from the archive's own directory, so nothing
-is extracted and nothing is written to disk. Every file also offers **Copy
+Docs, Sheets and Slides are rendered to PDF for preview. **Word `.docx`
+files are rendered as readable text** — headings, bold and italic, lists
+and tables — using the standard library, or
+[mammoth](https://github.com/mwilliamson/python-mammoth) for better
+fidelity if you install it. The converted markup is filtered to a small
+set of tags with no attributes, because a document is untrusted input.
+**ZIP archives list their contents** — read from the archive's own
+directory, so nothing is extracted and nothing is written to disk. Every file also offers **Copy
 link**, **Copy path**, **Download**, and **Open in Drive**. Previews are
 capped at 25 MB; anything larger or in a format the browser can't render
 says so and links out instead.

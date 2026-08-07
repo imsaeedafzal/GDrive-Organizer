@@ -1,3 +1,7 @@
 google-api-python-client>=2.100.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
+
+# Optional. Word (.docx) preview works without it, using the standard
+# library; install this for better fidelity — lists, styles and images.
+# mammoth>=1.6.0

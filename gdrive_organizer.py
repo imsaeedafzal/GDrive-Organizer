@@ -1651,6 +1651,130 @@ MAX_ZIP_BYTES = 100 * 1024 * 1024      # listing only reads the directory
 MAX_ZIP_ENTRIES = 2000
 MAX_SHARE_DETAIL = 1500                # per-item permission lookups
 SEARCH_LIMIT = 200                     # name-search results per query
+
+DOCX_MIME = ("application/vnd.openxmlformats-officedocument"
+             ".wordprocessingml.document")
+DOC_MIME = "application/msword"
+# Only these tags survive from a converted document. Word files can carry
+# arbitrary markup, and this HTML is injected into the page, so the output
+# is filtered rather than trusted.
+DOC_TAGS = {"p", "br", "strong", "em", "u", "s", "h1", "h2", "h3", "h4",
+            "h5", "h6", "ul", "ol", "li", "table", "thead", "tbody", "tr",
+            "td", "th", "blockquote", "pre", "code", "hr", "sup", "sub"}
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_runs(para) -> str:
+    """The text of one paragraph, keeping bold/italic/underline."""
+    out = []
+    for run in para.iter(W_NS + "r"):
+        text = "".join(t.text or "" for t in run.iter(W_NS + "t"))
+        if not text:
+            if run.find(W_NS + "br") is not None:
+                out.append("<br>")
+            continue
+        chunk = html.escape(text)
+        props = run.find(W_NS + "rPr")
+        if props is not None:
+            for tag, wrap in ((W_NS + "b", "strong"), (W_NS + "i", "em"),
+                              (W_NS + "u", "u"), (W_NS + "strike", "s")):
+                el = props.find(tag)
+                if el is not None and el.get(W_NS + "val") not in ("0",
+                                                                  "false"):
+                    chunk = f"<{wrap}>{chunk}</{wrap}>"
+        out.append(chunk)
+    return "".join(out)
+
+
+def _docx_para(para) -> str:
+    body = _docx_runs(para)
+    if not body.strip():
+        return ""
+    style = ""
+    props = para.find(W_NS + "pPr")
+    if props is not None:
+        st = props.find(W_NS + "pStyle")
+        if st is not None:
+            style = (st.get(W_NS + "val") or "").lower()
+        if props.find(W_NS + "numPr") is not None:
+            return f"<li>{body}</li>"
+    if style.startswith("heading"):
+        level = "".join(c for c in style if c.isdigit()) or "2"
+        lvl = min(max(int(level), 1), 6)
+        return f"<h{lvl}>{body}</h{lvl}>"
+    if style in ("title",):
+        return f"<h1>{body}</h1>"
+    if style in ("quote", "intensequote"):
+        return f"<blockquote>{body}</blockquote>"
+    return f"<p>{body}</p>"
+
+
+def docx_to_html(blob: bytes) -> Tuple[str, str]:
+    """Render a .docx to simple HTML. Returns (html, engine used).
+
+    Uses mammoth when it is installed, because it handles lists, styles
+    and images far better. Falls back to reading the document XML with the
+    standard library, so the feature works with nothing extra installed.
+    """
+    try:
+        import mammoth           # optional, much better fidelity
+        result = mammoth.convert_to_html(io.BytesIO(blob))
+        return result.value, "mammoth"
+    except ImportError:
+        pass
+    import xml.etree.ElementTree as ET
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        xml = z.read("word/document.xml")
+    body = ET.fromstring(xml).find(W_NS + "body")
+    if body is None:
+        return "", "builtin"
+    parts: List[str] = []
+    in_list = False
+    for node in body:
+        if node.tag == W_NS + "p":
+            piece = _docx_para(node)
+            if not piece:
+                continue
+            if piece.startswith("<li>") and not in_list:
+                parts.append("<ul>")
+                in_list = True
+            elif not piece.startswith("<li>") and in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(piece)
+        elif node.tag == W_NS + "tbl":
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            rows = []
+            for tr in node.findall(W_NS + "tr"):
+                cells = []
+                for tc in tr.findall(W_NS + "tc"):
+                    inner = "".join(_docx_runs(p)
+                                    for p in tc.findall(W_NS + "p"))
+                    cells.append(f"<td>{inner}</td>")
+                rows.append("<tr>" + "".join(cells) + "</tr>")
+            if rows:
+                parts.append("<table>" + "".join(rows) + "</table>")
+    if in_list:
+        parts.append("</ul>")
+    return "".join(parts), "builtin"
+
+
+def sanitize_html(raw: str) -> str:
+    """Keep only known-safe tags, and no attributes at all.
+
+    Converted documents are injected into the page, so anything that could
+    execute — scripts, event handlers, styles, links — is dropped rather
+    than filtered, which is the only version of this that is easy to be
+    sure about.
+    """
+    def repl(m: "re.Match[str]") -> str:
+        closing, name = m.group(1), m.group(2).lower()
+        if name not in DOC_TAGS:
+            return ""
+        return f"</{name}>" if closing else f"<{name}>"
+    return re.sub(r"<\s*(/?)\s*([A-Za-z0-9]+)[^>]*>", repl, raw)
 EXPORT_AS = {
     "application/vnd.google-apps.document": "application/pdf",
     "application/vnd.google-apps.presentation": "application/pdf",
@@ -2598,6 +2722,20 @@ border:1px solid var(--ring);border-radius:10px;overflow:hidden}
 .vimg{max-width:100%;max-height:62vh;display:block;margin:0 auto}
 .vframe{width:100%;height:66vh;border:1px solid var(--ring);
 border-radius:10px;margin:12px 0;background:#fff}
+.vdoc{background:var(--surface);border:1px solid var(--ring);
+border-radius:10px;padding:20px 24px;max-height:62vh;overflow:auto;
+margin:12px 0;line-height:1.65;font-size:14.5px}
+.vdoc h1,.vdoc h2,.vdoc h3,.vdoc h4{margin:18px 0 8px;line-height:1.3}
+.vdoc h1{font-size:22px}.vdoc h2{font-size:19px}.vdoc h3{font-size:16px}
+.vdoc p{margin:0 0 11px}
+.vdoc ul,.vdoc ol{margin:0 0 12px;padding-left:24px}
+.vdoc li{margin:3px 0}
+.vdoc table{border-collapse:collapse;margin:12px 0;width:100%}
+.vdoc td,.vdoc th{border:1px solid var(--grid);padding:6px 9px;
+vertical-align:top;font-size:13.5px}
+.vdoc blockquote{margin:12px 0;padding-left:14px;
+border-left:3px solid var(--grid);color:var(--ink2)}
+.vdoc img{max-width:100%}
 .vtext{background:var(--plane);border:1px solid var(--ring);
 border-radius:10px;padding:13px;max-height:62vh;overflow:auto;margin:12px 0;
 font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -3192,9 +3330,13 @@ function fileKind(n){
       m.slice(28))>-1 ? 'pdf' : 'none';
   if(m.indexOf('video/')===0) return 'video';
   if(m.indexOf('audio/')===0) return 'audio';
+  // Word documents before archives: a .docx is a zip, but listing its
+  // internals is useless when the point is to read the document.
+  if(m==='application/vnd.openxmlformats-officedocument.'+
+       'wordprocessingml.document' || ext==='docx') return 'doc';
+  if(m==='application/msword' || ext==='doc') return 'doc';
   if(m==='application/zip' || m==='application/x-zip-compressed' ||
-     ['zip','jar','war','apk','xpi','epub','docx','xlsx','pptx'
-     ].indexOf(ext)>-1) return 'zip';
+     ['zip','jar','war','apk','xpi','epub'].indexOf(ext)>-1) return 'zip';
   if(m.indexOf('text/')===0 || m==='application/json' ||
      m==='application/xml' || TEXT_MIME.indexOf(m)>-1 ||
      ['txt','md','log','csv','json','xml','yml','yaml','ini','env','toml',
@@ -4031,6 +4173,9 @@ function viewFile(id){
   } else if(kind==='zip'){
     body = '<div id=vzip class=vtext style="font:inherit">'+
       '<span class=spin></span> reading the archive&hellip;</div>';
+  } else if(kind==='doc'){
+    body = '<div id=vdoc class=vdoc><span class=spin></span> '+
+      'reading the document&hellip;</div>';
   } else {
     body = '<p class=muted>No inline preview for this file type — '+
       'open it in Drive or download it.</p>';
@@ -4039,6 +4184,29 @@ function viewFile(id){
   document.getElementById('ov').classList.add('on');
   if(kind==='text') loadText(url);
   if(kind==='zip') loadZip(it.id);
+  if(kind==='doc') loadDoc(it.id);
+}
+// Word documents, converted on the server and filtered down to a small
+// set of safe tags before being placed in the page.
+async function loadDoc(id){
+  const host = document.getElementById('vdoc');
+  if(!host) return;
+  let d;
+  try{ d = await api('/api/doc?id='+encodeURIComponent(id)); }
+  catch(e){
+    const raw = String(e);
+    const legacy = raw.indexOf('older binary')>-1;
+    host.innerHTML = '<p class=muted>'+esc(niceErr(e))+'</p>'+
+      (legacy?'':'<p class=muted>You can still open it in Drive or '+
+       'download it.</p>');
+    return;
+  }
+  if(d.empty){
+    host.innerHTML = '<p class=muted>This document has no text to '+
+      'show — it may contain only images.</p>';
+    return;
+  }
+  host.innerHTML = d.html;
 }
 // Archive contents, read from the zip's own directory — nothing is
 // extracted and nothing is written to disk.
@@ -6321,6 +6489,55 @@ def run_ui(args) -> None:
                         "canTrash", True),
                     "scan_files": st.get("files"),
                     "scan_bytes": st.get("bytes")})
+                return
+
+            if u.path == "/api/doc":
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                q = urllib.parse.parse_qs(u.query)
+                fid = (q.get("id") or [""])[0]
+                try:
+                    meta = locked(service.files().get(
+                        fileId=fid, fields="id,name,mimeType,size"))
+                    mime = meta.get("mimeType", "")
+                    size = int(meta.get("size") or 0)
+                    name = meta.get("name", "")
+                    if size > MAX_PREVIEW_BYTES:
+                        self._send({"error": f"the document is "
+                                             f"{human(size)}; the preview "
+                                             f"limit is "
+                                             f"{human(MAX_PREVIEW_BYTES)}"},
+                                   413)
+                        return
+                    is_docx = (mime == DOCX_MIME
+                               or name.lower().endswith(".docx"))
+                    if not is_docx:
+                        # The legacy binary .doc format is not something
+                        # this can read. Say so plainly instead of showing
+                        # a page of nonsense extracted from it.
+                        self._send({
+                            "error": "This is the older binary .doc "
+                                     "format, which cannot be read here. "
+                                     "Open in Drive shows it — Google "
+                                     "converts it for viewing.",
+                            "legacy": True}, 415)
+                        return
+                    with api_lock:
+                        blob = with_backoff(service.files().get_media(
+                            fileId=fid).execute)
+                    body, engine = docx_to_html(blob)
+                except zipfile.BadZipFile:
+                    self._send({"error": "this .docx could not be read — "
+                                         "it may be corrupt"}, 415)
+                    return
+                except Exception as err:
+                    self._send({"error": f"{type(err).__name__}: {err}"},
+                               500)
+                    return
+                clean = sanitize_html(body)
+                self._send({"html": clean, "engine": engine,
+                            "empty": not clean.strip()})
                 return
 
             if u.path == "/api/zip":
