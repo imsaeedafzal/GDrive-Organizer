@@ -92,6 +92,7 @@ import random
 import re
 import secrets
 import sys
+import threading
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -1662,6 +1663,7 @@ MAX_ZIP_BYTES = 100 * 1024 * 1024      # listing only reads the directory
 MAX_ZIP_ENTRIES = 2000
 MAX_SHARE_DETAIL = 1500                # per-item permission lookups
 SEARCH_LIMIT = 200                     # name-search results per query
+MAX_BODY = 64 * 1024 * 1024            # a request body is a plan, not data
 
 # ---------------------------------------------------------------------------
 # Local filesystem, for copying into Drive
@@ -6197,6 +6199,44 @@ class _Job:
         self.bytes_total = 0
         self.pct = 0
         self.cancel = False
+        self._lock = threading.Lock()
+
+    def claim(self) -> bool:
+        """Take the job for a new run, or say that one is already going.
+
+        Reading `finished` and then starting a thread are two steps, and
+        two requests that arrive together can both pass the read. The
+        second run then resets the first one's counters mid-flight and
+        writes a second undo log for changes the first is still making,
+        so neither log describes what actually happened. Claiming under a
+        lock closes that window.
+
+        The previous run's state is cleared here rather than at the top of
+        each worker, so that from the moment a caller is told yes, what
+        /api/progress reports is the new run and not the last one.
+        """
+        with self._lock:
+            if not self.finished:
+                return False
+            self.finished = False
+        self.total = self.done = 0
+        self.current = ""
+        self.log = []
+        self.errors = []
+        self.verify = ""
+        self.bytes_done = self.bytes_total = 0
+        self.pct = 0
+        self.cancel = False
+        return True
+
+    def release(self) -> None:
+        """Hand the job back. Every worker must reach this, including on
+        the way out of an unexpected error — a run left un-released wedges
+        the interface, because every later run is refused as 'already in
+        progress' with nothing actually running."""
+        self.current = ""
+        self.cancel = False
+        self.finished = True
 
 
 def run_ui(args) -> None:
@@ -6968,19 +7008,17 @@ def run_ui(args) -> None:
 
     def worker(plan: List[Dict[str, Any]],
                on_conflict: str = "keep") -> None:
-        job.finished = False
-        job.total = len(plan)
-        job.done = 0
-        job.log = []
-        job.errors = []
-        job.verify = ""
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(LOG_DIR, exist_ok=True)
-        job.undo_log = os.path.abspath(
-            os.path.join(LOG_DIR, f"ui_{stamp}.jsonl"))
+        # The caller claimed the job and cleared the last run's state. The
+        # try/finally covers everything from here, including opening the
+        # log: a failure on the way in must still hand the job back.
         folders: Optional[Folders] = None
         moved_ids: Set[str] = set()
         try:
+            job.total = len(plan)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(LOG_DIR, exist_ok=True)
+            job.undo_log = os.path.abspath(
+                os.path.join(LOG_DIR, f"ui_{stamp}.jsonl"))
             with open(job.undo_log, "w", encoding="utf-8") as log:
                 def log_mkdir(pth: str, fid: str) -> None:
                     log.write(json.dumps({"op": "mkdir", "file_id": fid,
@@ -7101,8 +7139,7 @@ def run_ui(args) -> None:
             job.verify = (f"verified: {good} of {len(plan)} planned items "
                           f"present and untrashed")
         finally:
-            job.current = ""
-            job.finished = True
+            job.release()
             # Moves rewrite the paths of everything underneath them, so the
             # index is refreshed behind the scenes — incrementally, since
             # the run touched a handful of folders, not the whole Drive.
@@ -7118,25 +7155,17 @@ def run_ui(args) -> None:
         hold the shared lock and freeze browsing for the whole transfer.
         """
         from googleapiclient.http import MediaFileUpload
-        job.finished = False
-        job.done = job.total = 0
-        job.log, job.errors = [], []
-        job.verify = ""
-        job.bytes_done = job.bytes_total = 0
-        job.current = ""
-        job.pct = 0
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(LOG_DIR, exist_ok=True)
-        job.undo_log = os.path.abspath(
-            os.path.join(LOG_DIR, f"upload_{stamp}.jsonl"))
+        # The caller claimed the job and cleared the last run's state. The
+        # try/finally covers everything from here, including opening the
+        # log: a failure on the way in must still hand the job back.
+        uploaded_ok: List[Tuple[str, str]] = []
         try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(LOG_DIR, exist_ok=True)
+            job.undo_log = os.path.abspath(
+                os.path.join(LOG_DIR, f"upload_{stamp}.jsonl"))
             up = build("drive", "v3", credentials=creds,
                        cache_discovery=False)
-        except Exception as err:
-            job.errors.append(f"could not start: {err}")
-            job.finished = True
-            return
-        try:
             with open(job.undo_log, "w", encoding="utf-8") as log:
                 def log_created(pth: str, fid: str) -> None:
                     log.write(json.dumps({"op": "mkdir", "file_id": fid,
@@ -7208,7 +7237,6 @@ def run_ui(args) -> None:
                         remote[key] = cur
                     return cur
 
-                uploaded_ok: List[Tuple[str, str]] = []
                 for unit in units:
                     if job.cancel:
                         job.log.append("cancelled — nothing further was "
@@ -7374,24 +7402,32 @@ def run_ui(args) -> None:
         except Exception as err:
             job.errors.append(f"{type(err).__name__}: {err}")
         finally:
-            job.current = ""
-            job.cancel = False
-            job.finished = True
+            job.release()
             schedule_reindex()
 
     def undo_worker(path: str) -> None:
+        # Everything here runs inside try/finally: a log that cannot be
+        # read is the likeliest failure, and letting it escape would leave
+        # the job claimed forever.
+        try:
+            _undo_run(path)
+        finally:
+            job.release()
+
+    def _undo_run(path: str) -> None:
         if not path or not os.path.exists(path):
-            job.finished = True
+            job.errors.append("that undo log is no longer on disk")
             return
         job.undo_log = path
-        with open(path, encoding="utf-8") as fh:
-            recs = [json.loads(l) for l in fh if l.strip()]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                recs = [json.loads(l) for l in fh if l.strip()]
+        except Exception as err:
+            job.errors.append(f"could not read {os.path.basename(path)}: "
+                              f"{err}")
+            return
         recs.reverse()
-        job.finished = False
         job.total = len(recs)
-        job.done = 0
-        job.log = []
-        job.errors = []
         for rec in recs:
             try:
                 if rec.get("op") == "trash":
@@ -7474,7 +7510,6 @@ def run_ui(args) -> None:
                 job.errors.append(
                     f"{rec.get('from', rec.get('path', ''))}: {err}")
             job.done += 1
-        job.finished = True
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -8114,8 +8149,29 @@ def run_ui(args) -> None:
             if not self._authed():
                 self._send({"error": "forbidden"}, 403)
                 return
-            n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n) or b"{}")
+            # A body that will not parse must come back as an error the
+            # page can show. Left to raise, it becomes a bare 500 with a
+            # traceback on the console and a fetch that fails silently.
+            try:
+                n = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                self._send({"error": "bad request"}, 400)
+                return
+            if n < 0 or n > MAX_BODY:
+                # The body is deliberately not drained, so the connection
+                # cannot be reused — the unread bytes would be parsed as
+                # the next request.
+                self.close_connection = True
+                self._send({"error": "that request is too large"}, 413)
+                return
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                self._send({"error": "bad request"}, 400)
+                return
+            if not isinstance(body, dict):
+                self._send({"error": "bad request"}, 400)
+                return
             u = urllib.parse.urlparse(self.path)
 
             if u.path == "/api/preview":
@@ -8194,9 +8250,6 @@ def run_ui(args) -> None:
                 return
 
             if u.path == "/api/execute":
-                if not job.finished:
-                    self._send({"error": "a run is already in progress"}, 409)
-                    return
                 plan = body.get("plan") or []
                 if not plan:
                     self._send({"error": "nothing to do"}, 400)
@@ -8204,6 +8257,11 @@ def run_ui(args) -> None:
                 conflict = body.get("on_conflict")
                 if conflict not in ("keep", "replace"):
                     conflict = "keep"
+                # Claimed last, once everything else has passed, so a
+                # rejected request never leaves the job held.
+                if not job.claim():
+                    self._send({"error": "a run is already in progress"}, 409)
+                    return
                 threading.Thread(target=worker, args=(plan, conflict),
                                  daemon=True).start()
                 self._send({"started": True})
@@ -8346,9 +8404,6 @@ def run_ui(args) -> None:
                 return
 
             if u.path == "/api/upload/execute":
-                if not job.finished:
-                    self._send({"error": "a run is already in progress"}, 409)
-                    return
                 plan = body.get("plan") or []
                 if not plan:
                     self._send({"error": "nothing to upload"}, 400)
@@ -8361,6 +8416,9 @@ def run_ui(args) -> None:
                                          "originals stay recoverable; "
                                          "install send2trash, or choose "
                                          "copy"}, 400)
+                    return
+                if not job.claim():
+                    self._send({"error": "a run is already in progress"}, 409)
                     return
                 threading.Thread(
                     target=upload_worker,
@@ -8497,9 +8555,6 @@ def run_ui(args) -> None:
                 return
 
             if u.path == "/api/undo":
-                if not job.finished:
-                    self._send({"error": "a run is in progress"}, 409)
-                    return
                 name = (body.get("log") or "").strip()
                 if name:
                     # Strict allowlist: a known log name, never a path.
@@ -8519,6 +8574,11 @@ def run_ui(args) -> None:
                     path = job.undo_log
                 if not path:
                     self._send({"error": "nothing to undo yet"}, 400)
+                    return
+                # Claimed after the log is resolved: undoing the last run
+                # reads job.undo_log, which a claim leaves alone.
+                if not job.claim():
+                    self._send({"error": "a run is in progress"}, 409)
                     return
                 threading.Thread(target=undo_worker, args=(path,),
                                  daemon=True).start()
