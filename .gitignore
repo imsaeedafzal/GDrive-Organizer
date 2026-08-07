@@ -29,6 +29,11 @@ folder_index.json
 # ---------------------------------------------------------------------------
 screenshots/
 
+# Local editor/assistant settings — not part of the project
+.claude/
+.vscode/
+.idea/
+
 # Python
 __pycache__/
 *.pyc
