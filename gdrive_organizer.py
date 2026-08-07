@@ -1754,6 +1754,9 @@ def local_entries(path: str) -> List[Dict[str, Any]]:
                     "name": e.name,
                     "path": os.path.join(path, e.name),
                     "folder": folder,
+                    # The viewer decides what it can show from the type,
+                    # and a local file has none of its own — so name one.
+                    "mime": "" if folder else guess_mime(e.name),
                     "size": 0 if folder else st.st_size,
                     "modified": datetime.fromtimestamp(
                         st.st_mtime).strftime("%Y-%m-%d"),
@@ -1958,7 +1961,19 @@ def guess_mime(name: str) -> str:
     """A content type for a local file, from its name."""
     import mimetypes
     mime, _ = mimetypes.guess_type(name)
-    return mime or "application/octet-stream"
+    if mime:
+        return mime
+    # mimetypes misses several common image and video types, and the
+    # viewer keys off the type, so a miss means no preview at all.
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    extra = {"heic": "image/heic", "heif": "image/heif",
+             "avif": "image/avif", "webp": "image/webp",
+             "jfif": "image/jpeg", "svg": "image/svg+xml",
+             "mkv": "video/x-matroska", "m4v": "video/mp4",
+             "flac": "audio/flac", "opus": "audio/opus",
+             "md": "text/markdown", "log": "text/plain",
+             "yml": "text/plain", "yaml": "text/plain"}
+    return extra.get(ext, "application/octet-stream")
 
 
 def sanitize_html(raw: str) -> str:
@@ -3349,7 +3364,15 @@ function busy(el, label){
 // Drive's API errors are long and JSON-ish; show the human part.
 function niceErr(e){
   const s = String(e && e.message ? e.message : e);
-  let m = s.match(/"message":\s*"([^"]+)"/) || s.match(/'message':\s*'([^']+)'/);
+  // This server's own errors come back as {"error": "..."} — read that
+  // first, or the raw JSON ends up on screen.
+  try{
+    const j = JSON.parse(s);
+    if(j && typeof j.error === 'string') return j.error;
+  }catch(_){}
+  let m = s.match(/"error":\s*"([^"]*)"/);
+  if(m) return JSON.parse('"'+m[1]+'"');
+  m = s.match(/"message":\s*"([^"]+)"/) || s.match(/'message':\s*'([^']+)'/);
   if(m) return m[1];
   m = s.match(/HttpError\s+(\d{3})/);
   if(m) return 'Drive returned an error (HTTP '+m[1]+').';
@@ -3569,15 +3592,21 @@ function fileKind(n){
   const name = String(n.name||'');
   const ext = name.lastIndexOf('.')>-1
     ? name.slice(name.lastIndexOf('.')+1).toLowerCase() : '';
-  if(m.indexOf('image/')===0) return 'image';
-  if(m==='application/pdf') return 'pdf';
+  // Type first, extension as a fallback: a file from this computer may
+  // have no type at all, and then the extension is all there is.
+  const IMG_EXT = ['jpg','jpeg','png','gif','webp','bmp','svg','ico','tif',
+                   'tiff','heic','heif','avif','jfif'];
+  const VID_EXT = ['mp4','mov','webm','m4v','ogv','mkv','avi'];
+  const AUD_EXT = ['mp3','wav','ogg','oga','m4a','flac','opus','aac'];
+  if(m.indexOf('image/')===0 || IMG_EXT.indexOf(ext)>-1) return 'image';
+  if(m==='application/pdf' || ext==='pdf') return 'pdf';
   if(m==='application/vnd.google-apps.drawing') return 'image';
   if(m==='application/vnd.google-apps.script') return 'text';
   if(m.indexOf('application/vnd.google-apps.')===0)
     return ['document','spreadsheet','presentation'].indexOf(
       m.slice(28))>-1 ? 'pdf' : 'none';
-  if(m.indexOf('video/')===0) return 'video';
-  if(m.indexOf('audio/')===0) return 'audio';
+  if(m.indexOf('video/')===0 || VID_EXT.indexOf(ext)>-1) return 'video';
+  if(m.indexOf('audio/')===0 || AUD_EXT.indexOf(ext)>-1) return 'audio';
   // Word documents before archives: a .docx is a zip, but listing its
   // internals is useless when the point is to read the document.
   if(m==='application/vnd.openxmlformats-officedocument.'+
@@ -7322,16 +7351,33 @@ def run_ui(args) -> None:
                     self._send({"error": "not a folder on this computer"},
                                400)
                     return
+                shown = path
                 try:
                     items = local_entries(path)
                 except PermissionError:
-                    self._send({"error": "this folder cannot be read — "
-                                         "permission denied"}, 403)
-                    return
+                    # Windows keeps compatibility junctions like
+                    # Documents\My Pictures that deny access outright and
+                    # point at the real folder. Follow it rather than
+                    # reporting a dead end the person cannot act on.
+                    real = os.path.realpath(path)
+                    if real != os.path.abspath(path) and os.path.isdir(real):
+                        try:
+                            items = local_entries(real)
+                            shown = real
+                        except OSError:
+                            self._send({"error": "Windows does not allow "
+                                                 "this folder to be opened"},
+                                       403)
+                            return
+                    else:
+                        self._send({"error": "Windows does not allow this "
+                                             "folder to be opened"}, 403)
+                        return
                 except OSError as err:
                     self._send({"error": str(err)}, 500)
                     return
-                self._send({"items": items, "path": os.path.abspath(path)})
+                self._send({"items": items, "path": os.path.abspath(shown),
+                            "followed": shown != path})
                 return
 
             if u.path in ("/api/localfile", "/api/localdoc",
