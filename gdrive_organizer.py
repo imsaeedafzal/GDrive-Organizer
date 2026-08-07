@@ -3341,6 +3341,15 @@ async function pollIndex(){
       FSTATUS = d;
       const bar = document.getElementById('indexbar');
       if(!bar) return;
+      if(d.building && d.mode==='sync'){
+        // Reading only what changed — a call or two, not a crawl. Worth a
+        // line so nothing looks frozen, but not a banner with a bar.
+        bar.style.display = '';
+        bar.innerHTML = '<span class=muted><span class=spin></span> '+
+          'checking what changed since last time&hellip;</span>';
+        await new Promise(r=>setTimeout(r,500));
+        continue;
+      }
       if(d.building){
         const pct = d.expected
           ? Math.min(99, Math.round(d.count/d.expected*100)) : 0;
@@ -5465,7 +5474,8 @@ def run_ui(args) -> None:
                                     "paths": [], "known": set(), "count": 0,
                                     "at": "", "error": "", "expected": 0,
                                     "stale": False, "again": False,
-                                    "parents": {}, "idpath": {}}
+                                    "parents": {}, "idpath": {},
+                                    "names": {}, "token": "", "mode": "full"}
     # Rolled-up file count and size per folder, computed live. The scan's
     # figures go stale the moment anything moves — after a reorganisation
     # most folders have no scan entry at all — so the tree cannot rely on
@@ -5495,11 +5505,11 @@ def run_ui(args) -> None:
                 d = json.load(fh)
             if d.get("root") != root_id:
                 return              # a different account's index
-            paths = d.get("paths") or []
-            folder_index.update(paths=paths, known=set(paths),
-                                count=len(paths), expected=len(paths),
-                                at=d.get("at", ""), ready=bool(paths),
-                                stale=True)
+            names = d.get("names") or {}
+            parents = d.get("parents") or {}
+            folder_index["names"] = names
+            folder_index["parents"] = parents
+            folder_index["token"] = d.get("token", "")
             tf = d.get("totals_files") or {}
             tb = d.get("totals_bytes") or {}
             if tf:
@@ -5507,9 +5517,14 @@ def run_ui(args) -> None:
                               at=d.get("at", ""), stale=True,
                               expected=d.get("totals_expected")
                               or totals["expected"])
-            print(f"  loaded {len(paths):,} folder paths and totals for "
-                  f"{len(tf):,} folders from {FINDEX_FILE} "
-                  f"(refreshing in the background)")
+            if names:
+                rebuild_paths()
+                folder_index["stale"] = True
+                folder_index["at"] = d.get("at", "")
+            print(f"  loaded {len(names):,} folders and totals for "
+                  f"{len(tf):,} from {FINDEX_FILE}"
+                  + (" — will read only what changed since"
+                     if folder_index["token"] else ""))
         except Exception as err:
             print(f"  (could not read {FINDEX_FILE}: {err})")
 
@@ -5519,7 +5534,12 @@ def run_ui(args) -> None:
             with open(FINDEX_FILE, "w", encoding="utf-8") as fh:
                 json.dump({"root": root_id,
                            "at": folder_index["at"],
-                           "paths": folder_index["paths"],
+                           # The change token and the maps it updates:
+                           # together these let the next run read only
+                           # what changed instead of the whole Drive.
+                           "token": folder_index.get("token", ""),
+                           "names": folder_index["names"],
+                           "parents": folder_index["parents"],
                            "totals_files": totals["files"],
                            "totals_bytes": totals["bytes"],
                            "totals_expected": totals["expected"]}, fh)
@@ -5540,6 +5560,151 @@ def run_ui(args) -> None:
                 folder_index["paths"].append(path)
                 folder_index["count"] = len(folder_index["paths"])
 
+    def rebuild_paths() -> None:
+        """Derive every folder path from the name/parent maps in memory.
+
+        Pure computation, no network: this is what makes an incremental
+        update cheap — change a few entries, then re-derive.
+        """
+        names = folder_index["names"]
+        par = folder_index["parents"]
+        idpath: Dict[str, str] = {}
+        for fid in names:
+            chain: List[str] = []
+            cur: Optional[str] = fid
+            seen: Set[str] = set()
+            rooted = False
+            while cur and cur not in seen:
+                seen.add(cur)
+                nm = names.get(cur)
+                if nm is None:
+                    break
+                chain.append(nm)
+                p = par.get(cur)
+                if p == root_id:
+                    rooted = True
+                    break
+                if not p:
+                    break        # orphan: no path from My Drive's root
+                cur = p
+            if rooted and chain:
+                idpath[fid] = "/".join(reversed(chain))
+        paths = sorted(idpath.values(), key=str.lower)
+        with findex_lock:
+            folder_index["idpath"] = idpath
+            folder_index.update(paths=paths, known=set(paths),
+                                count=len(paths), expected=len(paths),
+                                ready=True, stale=False,
+                                at=datetime.now().strftime("%H:%M"))
+
+    def shift_totals(fid: str, old_parent: Optional[str],
+                     new_parent: Optional[str]) -> None:
+        """Move a folder's subtotal from one ancestor chain to another.
+
+        Exact, and needs no per-file data: what a folder contributes to
+        every ancestor is precisely its own rolled-up subtotal.
+        """
+        nf = totals["files"].get(fid, 0)
+        nb = totals["bytes"].get(fid, 0)
+        if not nf and not nb:
+            return
+        par = folder_index["parents"]
+        for chain, sign in ((old_parent, -1), (new_parent, 1)):
+            cur, hops = chain, 0
+            while cur and hops < 200:
+                totals["files"][cur] = totals["files"].get(cur, 0) + sign*nf
+                totals["bytes"][cur] = totals["bytes"].get(cur, 0) + sign*nb
+                cur = par.get(cur)
+                hops += 1
+
+    def sync_changes() -> str:
+        """Apply only what changed since the last pass.
+
+        Returns "none" when the Drive is untouched, "ok" when deltas were
+        applied, and "stale" when a full crawl is needed — an expired
+        token, or no token at all.
+        """
+        tok = folder_index.get("token") or ""
+        if not tok or not folder_index.get("names"):
+            return "stale"
+        changed_files = False
+        seen_any = False
+        try:
+            while True:
+                resp = locked(service.changes().list(
+                    pageToken=tok, pageSize=1000,
+                    includeRemoved=True, restrictToMyDrive=True,
+                    fields="nextPageToken, newStartPageToken, changes("
+                           "fileId, removed, file(id,name,mimeType,"
+                           "parents,trashed))"))
+                for ch in resp.get("changes", []):
+                    seen_any = True
+                    fid = ch.get("fileId") or ""
+                    f = ch.get("file") or {}
+                    gone = ch.get("removed") or f.get("trashed")
+                    known_folder = fid in folder_index["names"]
+                    if gone:
+                        if known_folder:
+                            shift_totals(fid,
+                                         folder_index["parents"].get(fid),
+                                         None)
+                            folder_index["names"].pop(fid, None)
+                            folder_index["parents"].pop(fid, None)
+                        else:
+                            changed_files = True
+                        continue
+                    if f.get("mimeType") == FOLDER_MIME:
+                        new_par = (f.get("parents") or [None])[0]
+                        old_par = folder_index["parents"].get(fid)
+                        if known_folder and old_par != new_par:
+                            shift_totals(fid, old_par, new_par)
+                        folder_index["names"][fid] = f.get("name", "")
+                        folder_index["parents"][fid] = new_par
+                    else:
+                        # A file moved, appeared or changed size. Its
+                        # contribution cannot be derived from what is
+                        # stored, so the totals get a fresh count.
+                        changed_files = True
+                tok = resp.get("nextPageToken") or ""
+                if not tok:
+                    tok = resp.get("newStartPageToken") or ""
+                    break
+        except HttpError as err:
+            if getattr(err.resp, "status", None) in (404, 410):
+                return "stale"     # token too old; Drive wants a full read
+            raise
+        folder_index["token"] = tok
+        if not seen_any:
+            return "none"
+        rebuild_paths()
+        save_folder_cache()
+        if changed_files:
+            threading.Thread(target=build_totals, daemon=True).start()
+        return "ok"
+
+    def refresh_index() -> None:
+        """Bring the index up to date the cheapest way that is correct."""
+        with findex_lock:
+            if folder_index["building"]:
+                folder_index["again"] = True
+                return
+            folder_index.update(building=True, error="", again=False,
+                                mode="sync")
+        outcome = "stale"
+        try:
+            outcome = sync_changes()
+        except Exception as err:
+            folder_index["error"] = f"{type(err).__name__}: {err}"
+        finally:
+            with findex_lock:
+                folder_index["building"] = False
+                owed = folder_index.get("again", False)
+                folder_index["again"] = False
+        if outcome == "stale":
+            build_folder_index()
+        elif owed:
+            refresh_index()
+
     def build_folder_index() -> None:
         with findex_lock:
             if folder_index["building"]:
@@ -5551,7 +5716,8 @@ def run_ui(args) -> None:
                 # when this one finishes.
                 folder_index["again"] = True
                 return
-            folder_index.update(building=True, error="", again=False)
+            folder_index.update(building=True, error="", again=False,
+                                mode="full")
         try:
             by_id: Dict[str, Tuple[str, Optional[str]]] = {}
             pending: Set[str] = set()
@@ -5607,6 +5773,15 @@ def run_ui(args) -> None:
                     folder_index["ready"] = True
                 pending.difference_update(fid for fid, _ in resolved)
 
+            # Taken BEFORE the crawl, so any change made while it runs is
+            # still reported next time rather than being missed.
+            try:
+                start_token = locked(
+                    service.changes().getStartPageToken()
+                ).get("startPageToken", "")
+            except Exception:
+                start_token = ""
+
             token = None
             while True:
                 resp = locked(service.files().list(
@@ -5634,19 +5809,14 @@ def run_ui(args) -> None:
                 token = resp.get("nextPageToken")
                 if not token:
                     break
-            resolved = {f: path_of(f) for f in by_id}
-            idpath = {f: p for f, p in resolved.items() if p}
-            paths = sorted(idpath.values(), key=str.lower)
             with findex_lock:
-                folder_index["idpath"] = idpath
-                folder_index.update(paths=paths, known=set(paths),
-                                    count=len(paths), expected=len(paths),
-                                    at=datetime.now().strftime("%H:%M"),
-                                    ready=True, stale=False,
-                                    # Kept so folder totals can roll a
-                                    # file's size up through its ancestors.
-                                    parents={k: v[1]
-                                             for k, v in by_id.items()})
+                # Names and parents are the source of truth; every path is
+                # derived from them, which is what lets a later run update
+                # a few entries instead of re-reading the whole Drive.
+                folder_index["names"] = {k: v[0] for k, v in by_id.items()}
+                folder_index["parents"] = {k: v[1] for k, v in by_id.items()}
+                folder_index["token"] = start_token
+            rebuild_paths()
             save_folder_cache()
             threading.Thread(target=build_totals, daemon=True).start()
         except Exception as err:
@@ -5716,11 +5886,12 @@ def run_ui(args) -> None:
     def schedule_reindex() -> None:
         """Re-read folders and totals after something changed their shape.
 
-        Safe to call at any moment: the builders coalesce, so a request
-        landing mid-crawl is remembered and runs afterwards rather than
-        being dropped or starting a second pass.
+        Goes through the incremental path, so a rename or a delete costs a
+        single changes call rather than a full crawl. Safe to call at any
+        moment: requests coalesce, so one landing mid-pass is remembered
+        and run afterwards rather than dropped or doubled.
         """
-        threading.Thread(target=build_folder_index, daemon=True).start()
+        threading.Thread(target=refresh_index, daemon=True).start()
 
     def search_folders(q: str, limit: int = 60) -> List[str]:
         """Same token rules as the picker: every token must appear, and a
@@ -5942,9 +6113,9 @@ def run_ui(args) -> None:
             job.current = ""
             job.finished = True
             # Moves rewrite the paths of everything underneath them, so the
-            # index is refreshed behind the scenes. The old one stays
-            # searchable until the new one lands.
-            threading.Thread(target=build_folder_index, daemon=True).start()
+            # index is refreshed behind the scenes — incrementally, since
+            # the run touched a handful of folders, not the whole Drive.
+            schedule_reindex()
 
     def undo_worker(path: str) -> None:
         if not path or not os.path.exists(path):
@@ -6325,12 +6496,12 @@ def run_ui(args) -> None:
                 q = urllib.parse.parse_qs(u.query)
                 term = (q.get("q") or [""])[0]
                 if not folder_index["ready"] and not folder_index["building"]:
-                    threading.Thread(target=build_folder_index,
-                                     daemon=True).start()
+                    schedule_reindex()
                 # Search whatever is indexed so far — a half-built index is
                 # still useful, and it fills in as the crawl proceeds.
                 self._send({"ready": folder_index["ready"],
                             "building": folder_index["building"],
+                            "mode": folder_index.get("mode", "full"),
                             "count": folder_index["count"],
                             "totals_ready": totals["ready"],
                             "totals_building": totals["building"],
@@ -6757,7 +6928,7 @@ def run_ui(args) -> None:
     # the Drive, not just what has been expanded on screen. Last run's index
     # loads instantly and is refreshed in the background.
     load_folder_cache()
-    threading.Thread(target=build_folder_index, daemon=True).start()
+    threading.Thread(target=refresh_index, daemon=True).start()
 
     with Server(("127.0.0.1", args.port), H) as httpd:
         url = f"http://127.0.0.1:{args.port}/?t={auth}"

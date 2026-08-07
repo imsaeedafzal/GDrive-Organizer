@@ -111,6 +111,12 @@ something into a folder 12 levels deep that you've never opened. Search
 matches fragments of any level in any order — `nokia phones`,
 `phones nokia` and `personal/phones` all find `Personal/Phones/Nokia`.
 
+The index is built once and then **kept up to date by reading only what
+changed**, using Drive's change feed. A first run reads everything; after
+that, relaunching with nothing changed costs a single API call instead of
+a crawl, and a rename or a move costs one more. A full read happens again
+only if the change token expires.
+
 Name collisions are surfaced before execution, with an explicit choice
 between keeping both (Drive allows same-named siblings) and replacing —
 where the replaced item goes to trash and is restored if you undo.
