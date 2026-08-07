@@ -2941,7 +2941,8 @@ def cmd_verify(args) -> None:
 # It still cannot delete anything: the only Drive writes are folder creation
 # and re-parenting.
 
-UI_HTML = r"""<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+# UI_HEAD: document head and the page's own styles
+UI_HEAD = r"""<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <!-- The page URL carries the session token, and that token can read any
      file this computer can. Without this, following a link to Drive hands
@@ -3153,7 +3154,10 @@ overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:10px}
 .warn{color:var(--crit)}
 .muted{color:var(--ink2)}
 .sticky{position:sticky;top:12px}
-</style></head><body><div class=wrap>
+"""
+
+# UI_BODY: the markup: tabs, panels, dialogs
+UI_BODY = r"""</style></head><body><div class=wrap>
 
 <div style="display:flex;align-items:center;gap:14px;margin:0 0 6px">
   <img src="/logo" alt="Google Drive" style="height:30px;width:auto"
@@ -3302,7 +3306,10 @@ your whole Drive by name.">
   </div>
 </div></div>
 
-<script>
+"""
+
+# JS_CORE: escaping, formatting, fetch, dialogs, busy buttons
+JS_CORE = r"""<script>
 const TOKEN = "__TOKEN__";
 let CATS = [];          // existing root folders + your own additions
 let ROOT_FOLDERS = [];  // folder names that already exist at Drive root
@@ -3486,7 +3493,10 @@ function niceErr(e){
   return s.length > 300 ? s.slice(0,300)+'…' : s;
 }
 
-// ---- destinations ---------------------------------------------------------
+"""
+
+# JS_DEST: chosen destinations and the plan they build
+JS_DEST = r"""// ---- destinations ---------------------------------------------------------
 // The list is your real root folders, read live from Drive, plus anything
 // you add yourself. Your additions persist in this browser; new folders are
 // only created when a move into them actually executes.
@@ -3611,7 +3621,10 @@ async function delCat(c){
   rebuildCats(); drawCats(); redrawSelects(); drawPlan();
 }
 
-// ---- tree
+"""
+
+# JS_TREE: the Drive tree
+JS_TREE = r"""// ---- tree
 // Icons come from the MIME type first and the extension only as a fallback,
 // because Drive names are not required to have one.
 const EXT_ICON = {
@@ -3763,7 +3776,10 @@ function ancestorPlanned(path){
 function plannedFor(nd){
   return nd && nd.dataset ? PLAN[nd.dataset.id] : null;
 }
-// ---- one row, four trees --------------------------------------------------
+"""
+
+# JS_ROW: one row shell, shared by all four trees
+JS_ROW = r"""// ---- one row, four trees --------------------------------------------------
 // Every tree row has the same anatomy: a toggle, an icon, a name, some
 // tags, some stats, some actions and a trailing control. The trees differ
 // only in what goes in those slots, so they fill in a shell rather than
@@ -3843,7 +3859,10 @@ function rowHtml(n){
         '</span>'
       : destBtn(n.path, n.id, n.name, planned?planned.target:'')});
 }
-// ---- destination picker ---------------------------------------------------
+"""
+
+# JS_PICKER: the destination picker and its search
+JS_PICKER = r"""// ---- destination picker ---------------------------------------------------
 // A searchable popup rather than a <select>: the destination list grows with
 // every folder you browse, and a native dropdown of hundreds of entries is
 // unusable. One shared popup serves every row, so the tree stays light.
@@ -4335,7 +4354,10 @@ function drawPlan(){
 }
 function unplan(k){ delete PLAN[k]; drawPlan(); refreshTags(); redrawSelects(); }
 
-// ---- search ---------------------------------------------------------------
+"""
+
+# JS_SEARCH: whole-Drive search
+JS_SEARCH = r"""// ---- search ---------------------------------------------------------------
 // The filter box narrows what is on screen; Enter searches the whole Drive
 // by name. Results are real rows: you can plan a move, rename, delete or
 // jump to where the item lives.
@@ -4420,7 +4442,10 @@ function drawClear(){
     ? '' : 'none';
 }
 
-// ---- from this PC ---------------------------------------------------------
+"""
+
+# JS_LOCAL: the From this PC tab and its uploads
+JS_LOCAL = r"""// ---- from this PC ---------------------------------------------------------
 // Browse the computer and choose Drive destinations for what should go up.
 // Uploading only ever adds to Drive; the originals are left alone unless
 // Move is chosen, and then they go to the recycle bin, never straight out.
@@ -4821,7 +4846,10 @@ async function cancelRun(btn){
   done();
 }
 
-// ---- drag and drop --------------------------------------------------------
+"""
+
+# JS_DRAG: dragging a row onto a folder to plan it
+JS_DRAG = r"""// ---- drag and drop --------------------------------------------------------
 // Dragging a row onto a folder plans a move, exactly as choosing that
 // folder from the dropdown does. Nothing moves in Drive until Execute.
 let DRAG = null;
@@ -4899,7 +4927,10 @@ async function dropOn(ev, row){
 // Clicks on controls (selects, buttons, chips) keep their own behaviour.
 // One row handler for every tree. Which tree a row belongs to decides how
 // it expands and where its preview comes from; nothing else differs.
-function rowSource(row){
+"""
+
+# JS_ROWACT: expanding a row, and finding what it refers to
+JS_ROWACT = r"""function rowSource(row){
   return row.closest('#ltree') ? 'local' : 'drive';
 }
 function rowToggle(row, ev){
@@ -4966,7 +4997,10 @@ async function copyText(text, btn){
 // No token in the URL: the session cookie set when the page loaded
 // carries it. A token here would end up in browser history and in
 // anything the reader copies or downloads.
-function fileUrl(it, source){
+"""
+
+# JS_VIEWER: previewing a file, from either tree
+JS_VIEWER = r"""function fileUrl(it, source){
   return source==='local'
     ? '/api/localfile?path='+encodeURIComponent(it.path)
     : '/api/file?id='+encodeURIComponent(it.id);
@@ -5138,7 +5172,10 @@ async function loadText(url){
 // Rename in place. A rename changes the path of the item and everything
 // beneath it, so anything already planned under the old path is rewritten
 // and the tree is re-read afterwards.
-async function renameItem(fid, name, isFolder, btn){
+"""
+
+# JS_ITEM: rename, trash, and filtering
+JS_ITEM = r"""async function renameItem(fid, name, isFolder, btn){
   const next = await uiPrompt(
     'New name for '+(isFolder?'the folder ':'')+'<b>'+esc(name)+'</b>:',
     name, {title:'Rename', yes:'Rename'});
@@ -5346,7 +5383,10 @@ function filterTree(){
   });
 }
 
-// ---- sharing view ---------------------------------------------------------
+"""
+
+# JS_SHARING: the Sharing tab
+JS_SHARING = r"""// ---- sharing view ---------------------------------------------------------
 // Same live tree, but each shared item shows exactly who has access, and an
 // x on a chip revokes that one permission (confirmed, logged, restorable).
 let VIEW='org';
@@ -5665,7 +5705,10 @@ async function refreshShare(){
   await bootShare();
 }
 
-// ---- trash view -----------------------------------------------------------
+"""
+
+# JS_TRASH: the Trash tab
+JS_TRASH = r"""// ---- trash view -----------------------------------------------------------
 // Strictly read-only plus restore. There is deliberately no way to empty
 // the trash or permanently delete anything from here.
 // The trash is a list of things you threw away, so it reads as a table
@@ -5942,7 +5985,10 @@ async function refreshTree(){
   }
 }
 
-// ---- execute
+"""
+
+# JS_EXECUTE: preview, confirm, run, and follow progress
+JS_EXECUTE = r"""// ---- execute
 async function execute(){
   const items = Object.values(PLAN);
   if(!items.length) return;
@@ -6154,7 +6200,10 @@ async function startUndo(log){
   poll();
 }
 
-// ---- revisions ------------------------------------------------------------
+"""
+
+# JS_REVISIONS: past runs and undoing them
+JS_REVISIONS = r"""// ---- revisions ------------------------------------------------------------
 async function loadRuns(){
   let d;
   try{ d = await api('/api/runs'); }catch(e){ return; }
@@ -6245,7 +6294,10 @@ async function runDetails(log){
     '<button class=btn onclick=closeOv()>Close</button></div>';
 }
 
-// ---- boot
+"""
+
+# JS_BOOT: startup
+JS_BOOT = r"""// ---- boot
 async function boot(){
   const d = await api('/api/root');
   ROOT = d.root;
@@ -6295,6 +6347,30 @@ async function boot(){
 }
 boot();
 </script></body></html>"""
+
+# The page, assembled. It is split only so that each part can be
+# found and edited on its own — one 3,000-line string is not
+# navigable, and the browser never sees the difference.
+UI_HTML = "".join((
+    UI_HEAD,
+    UI_BODY,
+    JS_CORE,
+    JS_DEST,
+    JS_TREE,
+    JS_ROW,
+    JS_PICKER,
+    JS_SEARCH,
+    JS_LOCAL,
+    JS_DRAG,
+    JS_ROWACT,
+    JS_VIEWER,
+    JS_ITEM,
+    JS_SHARING,
+    JS_TRASH,
+    JS_EXECUTE,
+    JS_REVISIONS,
+    JS_BOOT,
+))
 
 
 class _Job:
