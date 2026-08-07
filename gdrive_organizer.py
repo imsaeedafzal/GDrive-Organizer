@@ -6940,6 +6940,17 @@ def run_ui(args) -> None:
             return
         try:
             with open(job.undo_log, "w", encoding="utf-8") as log:
+                def log_created(pth: str, fid: str) -> None:
+                    log.write(json.dumps({"op": "mkdir", "file_id": fid,
+                                          "path": pth}) + "\n")
+                    log.flush()
+
+                # Resolves a destination path like "Clients/Acme" to a
+                # folder id, creating what is missing. Bound to this
+                # worker's own client rather than the interface's.
+                upfolders = Folders(up, root_id, True,
+                                    on_create=log_created)
+
                 def mkdir_remote(parent: str, name: str) -> str:
                     made = with_backoff(up.files().create(
                         body={"name": name, "mimeType": FOLDER_MIME,
@@ -7008,7 +7019,7 @@ def run_ui(args) -> None:
                     job.current = unit["rel"]
                     job.pct = 0
                     try:
-                        base = unit["targetId"] or folders.resolve(
+                        base = unit["targetId"] or upfolders.resolve(
                             unit["target"])
                         rel_dir = os.path.dirname(unit["rel"])
                         parent = ensure(base, rel_dir.replace("\\", "/"))
