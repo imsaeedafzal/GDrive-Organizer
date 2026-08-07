@@ -2357,6 +2357,29 @@ def run_undo(args) -> None:
                     with_backoff(service.files().update(
                         fileId=fid, body={"trashed": True}).execute)
                 ok += 1
+            elif rec.get("op") == "replace":
+                # The file was given new contents rather than replaced
+                # outright, so undoing means putting its previous contents
+                # back — not deleting a file that existed before this run.
+                prev = rec.get("prev_revision") or ""
+                if not prev:
+                    skipped += 1
+                    Progress.note(
+                        f"cannot restore the earlier version of "
+                        f"{rec.get('name', '')} — Drive kept none")
+                elif args.execute:
+                    from googleapiclient.http import MediaIoBaseUpload
+                    data = with_backoff(service.revisions().get_media(
+                        fileId=fid, revisionId=prev).execute)
+                    with_backoff(service.files().update(
+                        fileId=fid,
+                        media_body=MediaIoBaseUpload(
+                            io.BytesIO(data),
+                            mimetype="application/octet-stream",
+                            resumable=False)).execute)
+                    ok += 1
+                else:
+                    ok += 1
             elif rec.get("op") == "local_recycle":
                 # Nothing to do in Drive, and restoring from the recycle
                 # bin is the operating system's job — say so rather than
@@ -2970,6 +2993,18 @@ border-left:3px solid var(--grid);color:var(--ink2)}
 border-radius:10px;padding:13px;max-height:62vh;overflow:auto;margin:12px 0;
 font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
 white-space:pre-wrap;overflow-wrap:anywhere}
+.ttable{width:100%;border-collapse:collapse;font-size:13px}
+.ttable th{text-align:left;font-size:11.5px;text-transform:uppercase;
+letter-spacing:.04em;color:var(--muted);font-weight:650;
+padding:6px 9px;border-bottom:1px solid var(--grid);white-space:nowrap}
+.ttable td{padding:6px 9px;border-bottom:1px solid var(--grid);
+vertical-align:middle}
+.ttable tr:hover td{background:var(--grid)}
+.ttable td.num,.ttable th.num{text-align:right;
+font-variant-numeric:tabular-nums;white-space:nowrap}
+.ttable td.tname{cursor:pointer;max-width:0;width:60%;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.ttable td.muted{color:var(--ink2);white-space:nowrap}
 .dtable{width:100%;border-collapse:collapse;font-size:12.5px}
 .dtable td{padding:5px 7px;border-bottom:1px solid var(--grid);
 vertical-align:top;overflow-wrap:anywhere}
@@ -4482,15 +4517,23 @@ async function uploadRun(){
     d.files.toLocaleString()+' file'+(d.files===1?'':'s')+'</h2>'+
     (cl.length
       ? '<div class=card style="border-color:var(--warn)"><strong>'+
-        cl.length+' name'+(cl.length===1?'':'s')+' already exist'+
-        (cl.length===1?'s':'')+' at the destination</strong>'+
+        cl.length+' of these already exist'+(cl.length===1?'s':'')+
+        ' in the destination</strong>'+
         '<div class=plog style="max-height:120px">'+
-        cl.map(c=>esc(c.target+'/'+c.name)).join('\n')+'</div>'+
+        cl.map(c=>esc(c.target+'/'+c.name)+
+          (c.existing && c.existing.folder?'   (folder)':'')).join('\n')+
+        '</div>'+
+        '<div class=muted style="margin-top:8px">A folder of the same '+
+        'name is always merged into — nothing already inside it is '+
+        'removed. The choice below applies to individual files.</div>'+
         '<div style="margin-top:10px;display:flex;flex-direction:column;'+
         'gap:6px"><label><input type=radio name=uconf value=keep checked> '+
-        '<b>Keep both</b> — Drive allows the same name twice</label>'+
+        '<b>Keep both</b> — upload alongside, leaving two files with the '+
+        'same name</label>'+
         '<label><input type=radio name=uconf value=replace> '+
-        '<b>Replace</b> — the existing item goes to Drive trash</label>'+
+        '<b>Replace</b> — give the file in Drive these new contents. It '+
+        'keeps its link, sharing and comments, and its old contents stay '+
+        'available as a previous version</label>'+
         '</div></div>'
       : '')+
     '<p class=muted>New folders: '+(d.creates.length?
@@ -5054,6 +5097,8 @@ function refreshEmptyState(nd){
   }
 }
 function filterTree(){
+  // The trash is a table, not a tree; it filters on its own terms.
+  if(VIEW==='trash'){ filterTrash(); return; }
   const v=document.getElementById('filter').value.toLowerCase();
   const hideUn = VIEW==='share' &&
     document.getElementById('hideunshared').checked;
@@ -5403,19 +5448,76 @@ async function refreshShare(){
 // ---- trash view -----------------------------------------------------------
 // Strictly read-only plus restore. There is deliberately no way to empty
 // the trash or permanently delete anything from here.
+// The trash is a list of things you threw away, so it reads as a table
+// ordered by when — newest first — rather than as a tree.
+let TFILTER = 'all';
+const TKINDS = [['all','Everything'], ['folder','Folders'],
+                ['image','Images'], ['doc','Documents'], ['pdf','PDFs'],
+                ['video','Video'], ['audio','Audio'], ['zip','Archives'],
+                ['text','Text & code'], ['other','Everything else']];
+function trashKind(n){
+  if(n.folder) return 'folder';
+  const k = fileKind(n);
+  if(k==='html') return 'text';
+  return ['image','doc','pdf','video','audio','zip','text']
+    .indexOf(k)>-1 ? k : 'other';
+}
 function trashRow(n){
-  return '<div class=tnode data-id="'+esc(n.id)+'" data-folder="0" '+
-    'data-path="'+esc(n.name)+'">'+
-    '<div class=srow onclick="rowToggle(this,event)">'+
-    '<span class=tw></span>'+
-    '<span class=ic>'+icon(n)+'</span>'+
-    '<span class=nm title="'+esc(n.name)+'">'+esc(n.name)+'</span>'+
-    '<span class=mt>'+(n.size?human(n.size)+' &middot; ':'')+
-    esc(n.modified||'')+'</span>'+
-    '<button class="btn ghost" style="padding:2px 9px;font-size:12px" '+
-    'onclick="restoreItem(\''+esc(n.id)+'\',\''+esc(n.name)+'\',this)">'+
-    'Restore</button>'+
-    '</div></div>';
+  return '<tr class=tnode data-id="'+esc(n.id)+'" data-folder="0" '+
+    'data-kind="'+trashKind(n)+'" data-path="'+esc(n.name)+'">'+
+    '<td class=tname onclick="rowToggle(this,event)">'+
+    '<span class=ic>'+icon(n)+'</span> '+
+    '<span class=nm title="'+esc(n.name)+'">'+esc(n.name)+'</span></td>'+
+    '<td class=muted>'+esc(n.folder?'folder':trashKind(n))+'</td>'+
+    '<td class="num muted">'+(n.size?human(n.size):'')+'</td>'+
+    '<td class=muted>'+esc(n.trashed||n.modified||'')+'</td>'+
+    '<td><button class="btn ghost" style="padding:2px 9px;font-size:12px" '+
+    'onclick="restoreItem(\''+esc(n.id)+'\',\''+
+    esc(n.name).replace(/'/g,"\\'")+'\',this)">Restore</button></td>'+
+    '</tr>';
+}
+function drawTrash(){
+  const tt = document.getElementById('ttree');
+  if(!TCACHE.length){
+    tt.innerHTML = '<div class=muted style="padding:6px">The trash is '+
+      'empty.</div>';
+    return;
+  }
+  const counts = {};
+  TCACHE.forEach(n=>{ const k=trashKind(n); counts[k]=(counts[k]||0)+1; });
+  const chips = TKINDS.filter(p=>p[0]==='all'||counts[p[0]])
+    .map(p=>'<button class="cat'+(TFILTER===p[0]?' inuse':'')+
+      '" style="cursor:pointer" onclick="setTrashFilter(\''+p[0]+'\')">'+
+      esc(p[1])+'<span class=cnt>'+
+      (p[0]==='all'?TCACHE.length:counts[p[0]])+'</span></button>').join('');
+  tt.innerHTML =
+    '<div class=note style="margin:0 0 10px">'+
+    TCACHE.length.toLocaleString()+' item'+(TCACHE.length===1?'':'s')+
+    ' in the trash, most recently thrown away first. Drive removes them '+
+    'itself after 30 days. This page can restore, and cannot empty the '+
+    'trash.</div>'+
+    '<div class=cats style="margin-bottom:10px">'+chips+'</div>'+
+    '<table class=ttable><thead><tr><th>Name</th><th>Type</th>'+
+    '<th class=num>Size</th><th>Trashed</th><th></th></tr></thead>'+
+    '<tbody>'+TCACHE.map(trashRow).join('')+'</tbody></table>'+
+    '<div id=tempty class=muted style="display:none;padding:10px">'+
+    'Nothing matches.</div>';
+  filterTrash();
+}
+function setTrashFilter(k){ TFILTER = k; drawTrash(); }
+function filterTrash(){
+  const v = (document.getElementById('filter').value||'').toLowerCase();
+  let shown = 0;
+  document.querySelectorAll('#ttree tbody tr').forEach(tr=>{
+    const nm = tr.querySelector('.nm');
+    const name = nm ? nm.textContent : '';
+    const ok = (!v || name.toLowerCase().indexOf(v)>-1)
+      && (TFILTER==='all' || tr.dataset.kind===TFILTER);
+    tr.style.display = ok?'':'none';
+    if(ok) shown++;
+  });
+  const none = document.getElementById('tempty');
+  if(none) none.style.display = shown?'none':'';
 }
 async function bootTrash(){
   const tt = document.getElementById('ttree');
@@ -5425,15 +5527,7 @@ async function bootTrash(){
   try{
     const d = await api('/api/trash');
     TCACHE = d.items;
-    tt.innerHTML = (d.items.length
-      ? '<div class=muted style="font-size:12.5px;margin:0 0 8px">'+
-        d.items.length.toLocaleString()+' item(s) in trash'+
-        (d.truncated?' (showing the first '+d.items.length.toLocaleString()+
-          ')':'')+' &middot; view and restore only — this page cannot '+
-        'empty the trash</div>'+
-        d.items.map(trashRow).join('')
-      : '<div class=muted style="padding:6px">The trash is empty.</div>');
-    filterTree();
+    drawTrash();
   }catch(e){
     tt.innerHTML = '<div class=warn style="padding:6px">could not load: '+
       esc(e)+'</div>';
@@ -5449,9 +5543,8 @@ async function restoreItem(fid, name, btn){
   const undo = busy(btn, 'Restoring…');
   try{
     await api('/api/restore',{id:fid});
-    const nd = btn.closest('.tnode');
-    if(nd) nd.remove();
     TCACHE = TCACHE.filter(i=>i.id!==fid);
+    drawTrash();
   }catch(e){
     undo();
     uiAlert(esc(niceErr(e)), {title:'Could not restore'});
@@ -6251,7 +6344,7 @@ def run_ui(args) -> None:
             resp = locked(service.files().list(
                 q="trashed = true and 'me' in owners",
                 fields="nextPageToken, files(id,name,mimeType,size,"
-                       "modifiedTime,webViewLink)",
+                       "modifiedTime,trashedTime,webViewLink)",
                 pageSize=1000, pageToken=token))
             out.extend(resp.get("files", []))
             token = resp.get("nextPageToken")
@@ -7024,23 +7117,44 @@ def run_ui(args) -> None:
                         rel_dir = os.path.dirname(unit["rel"])
                         parent = ensure(base, rel_dir.replace("\\", "/"))
                         name = os.path.basename(unit["rel"])
-                        if on_conflict == "replace":
-                            ex = find_clash(unit["target"], name, "", parent)
-                            if ex:
-                                with_backoff(up.files().update(
-                                    fileId=ex["id"],
-                                    body={"trashed": True}).execute)
-                                log.write(json.dumps({
-                                    "op": "trash", "file_id": ex["id"],
-                                    "name": ex["name"],
-                                    "from": f"{unit['target']}/{name}",
-                                    "replaced_by": unit["path"]}) + "\n")
                         media = MediaFileUpload(_long(unit["path"]),
                                                 chunksize=UPLOAD_CHUNK,
                                                 resumable=True)
-                        req = up.files().create(
-                            body={"name": name, "parents": [parent]},
-                            media_body=media, fields="id,size")
+                        # Replacing means giving the file that is already
+                        # there new contents — it keeps its id, its link,
+                        # its sharing and its comments, and the old
+                        # contents stay as a previous version. Trashing it
+                        # and uploading a separate file would break every
+                        # link to it for no reason.
+                        replacing = None
+                        if on_conflict == "replace":
+                            ex = find_clash(unit["target"], name, "", parent)
+                            if ex and not ex["folder"]:
+                                replacing = ex
+                        if replacing:
+                            prev = ""
+                            try:
+                                revs = with_backoff(up.revisions().list(
+                                    fileId=replacing["id"],
+                                    fields="revisions(id)").execute)
+                                got = revs.get("revisions") or []
+                                prev = got[-1]["id"] if got else ""
+                                if prev:
+                                    # Drive discards old revisions after 30
+                                    # days; pinning keeps undo honest.
+                                    with_backoff(up.revisions().update(
+                                        fileId=replacing["id"],
+                                        revisionId=prev,
+                                        body={"keepForever": True}).execute)
+                            except Exception:
+                                prev = ""
+                            req = up.files().update(
+                                fileId=replacing["id"], media_body=media,
+                                fields="id,size")
+                        else:
+                            req = up.files().create(
+                                body={"name": name, "parents": [parent]},
+                                media_body=media, fields="id,size")
                         resp = None
                         while resp is None:
                             if job.cancel:
@@ -7053,14 +7167,19 @@ def run_ui(args) -> None:
                                            f"{unit['rel']}")
                             break
                         log.write(json.dumps({
-                            "op": "upload", "file_id": resp["id"],
+                            "op": "replace" if replacing else "upload",
+                            "file_id": resp["id"],
                             "name": name, "from": unit["path"],
                             "to": f"{unit['target']}/{unit['rel']}",
+                            "prev_revision": prev if replacing else "",
                             "size": unit["size"]}) + "\n")
                         log.flush()
                         uploaded_ok.append((resp["id"], unit["path"]))
                         job.bytes_done += unit["size"]
-                        job.log.append(f"uploaded  {unit['rel']}")
+                        job.log.append(
+                            (f"replaced  {unit['rel']}  — kept as a "
+                             f"previous version" if replacing
+                             else f"uploaded  {unit['rel']}"))
                     except Exception as err:
                         msg = f"FAILED {unit['rel']}: {err}"
                         job.errors.append(msg)
@@ -7145,6 +7264,25 @@ def run_ui(args) -> None:
                     locked(service.files().update(
                         fileId=rec["file_id"], body={"trashed": True}))
                     job.log.append(f"removed upload  {rec.get('to', '')}")
+                elif rec.get("op") == "replace":
+                    prev = rec.get("prev_revision") or ""
+                    if not prev:
+                        job.log.append(
+                            f"no earlier version kept for "
+                            f"{rec.get('name', '')}")
+                    else:
+                        from googleapiclient.http import MediaIoBaseUpload
+                        data = locked(service.revisions().get_media(
+                            fileId=rec["file_id"], revisionId=prev))
+                        locked(service.files().update(
+                            fileId=rec["file_id"],
+                            media_body=MediaIoBaseUpload(
+                                io.BytesIO(data),
+                                mimetype="application/octet-stream",
+                                resumable=False)))
+                        job.log.append(
+                            f"restored the earlier version of "
+                            f"{rec.get('name', '')}")
                 elif rec.get("op") == "local_recycle":
                     job.log.append(
                         f"in your recycle bin — restore it from there: "
@@ -7767,7 +7905,12 @@ def run_ui(args) -> None:
                     "mime": t.get("mimeType", ""),
                     "size": int(t.get("size") or 0),
                     "modified": (t.get("modifiedTime") or "")[:10],
+                    "trashed": (t.get("trashedTime") or "")[:16].replace(
+                        "T", " "),
                     "link": t.get("webViewLink", "")} for t in raw]
+                # Most recently thrown away first: that is what anyone
+                # opening this is looking for.
+                titems.sort(key=lambda t: t["trashed"], reverse=True)
                 self._send({"items": titems, "truncated": truncated})
                 return
             if u.path == "/api/progress":

@@ -27,6 +27,7 @@ The strongest things it can do are:
 | Trash a duplicate you confirmed | Trash tab, or `undo` | One explicit click per item, in `review` |
 | Remove one sharing permission | `undo` (it's re-created) | Records who lost access, so it can be restored |
 | Upload from this computer | `undo` (removes the copy) | Adds to Drive; originals untouched unless you pick Move |
+| Replace a file when uploading | `undo` (previous version restored) | Same file gets new contents — keeps its id, link and sharing |
 | Move (upload, then remove local) | your **recycle bin** | Only after the upload is verified; never a direct delete |
 
 Everything else is read-only. Every run writes a JSON-lines undo log before
@@ -86,15 +87,20 @@ what you see is what's actually there — not a snapshot.
   open, and revoke access from that list. Folders show how many shared
   items are anywhere beneath them, so you follow the trail down instead of
   clicking blindly.
-- **Trash** — view and restore. Deliberately **no** empty-trash or
-  permanent-delete capability.
+- **Trash** — a table of what you've thrown away, newest first, with
+  search and one-click type filters. Restore only: deliberately **no**
+  empty-trash or permanent-delete capability.
 - **From this PC** — browse your computer, pick a Drive folder for
   anything you want up there, and upload. Folder structure is recreated,
   and hidden files and build folders (`node_modules`, `.git`, `dist`,
   `venv`…) are skipped by default. Choose **Copy** to leave everything
   local, or **Move** to send each original to the **recycle bin** — but
   only after its upload is confirmed in Drive at the right size, and never
-  by deleting outright. Uploads are resumable, so a dropped connection
+  by deleting outright. Where a file of the same name is already in Drive,
+  **Replace gives that file the new contents** — it keeps its id, link,
+  sharing and comments, and the old contents remain as a previous version
+  that undo can restore. Folders of the same name are merged into, never
+  replaced. Uploads are resumable, so a dropped connection
   continues rather than restarting, and a long transfer can be stopped
   between files. Undo removes what was uploaded.
 
