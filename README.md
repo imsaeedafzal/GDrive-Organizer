@@ -26,6 +26,8 @@ The strongest things it can do are:
 | Send a file or folder to the trash | Trash tab, or `undo` | Same as deleting in Drive: kept 30 days, restorable the whole time |
 | Trash a duplicate you confirmed | Trash tab, or `undo` | One explicit click per item, in `review` |
 | Remove one sharing permission | `undo` (it's re-created) | Records who lost access, so it can be restored |
+| Upload from this computer | `undo` (removes the copy) | Adds to Drive; originals untouched unless you pick Move |
+| Move (upload, then remove local) | your **recycle bin** | Only after the upload is verified; never a direct delete |
 
 Everything else is read-only. Every run writes a JSON-lines undo log before
 its first change. Nothing writes without `--execute`, and the live UI shows
@@ -86,6 +88,15 @@ what you see is what's actually there — not a snapshot.
   clicking blindly.
 - **Trash** — view and restore. Deliberately **no** empty-trash or
   permanent-delete capability.
+- **From this PC** — browse your computer, pick a Drive folder for
+  anything you want up there, and upload. Folder structure is recreated,
+  and hidden files and build folders (`node_modules`, `.git`, `dist`,
+  `venv`…) are skipped by default. Choose **Copy** to leave everything
+  local, or **Move** to send each original to the **recycle bin** — but
+  only after its upload is confirmed in Drive at the right size, and never
+  by deleting outright. Uploads are resumable, so a dropped connection
+  continues rather than restarting, and a long transfer can be stopped
+  between files. Undo removes what was uploaded.
 
 Any row can be sent to the trash from the tree. The confirmation tells you
 what it costs before you agree: for a folder, how many items go with it,

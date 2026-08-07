@@ -5,3 +5,8 @@ google-auth-oauthlib>=1.2.0
 # Optional. Word (.docx) preview works without it, using the standard
 # library; install this for better fidelity — lists, styles and images.
 # mammoth>=1.6.0
+
+# Optional. Only needed to MOVE files from this computer into Drive on
+# macOS or Linux; on Windows the recycle bin is used directly. Without it,
+# Move is disabled and Copy still works.
+# send2trash>=1.8.0

@@ -15,7 +15,11 @@ It has no permanent-delete capability. Everything it can do is reversible:
     permission (who it was is recorded in logs/share_actions.jsonl, and
     `undo logs/share_actions.jsonl --execute` restores it),
   * renaming a file or folder (the old name is recorded in
-    logs/rename_actions.jsonl, and undo puts it back), or
+    logs/rename_actions.jsonl, and undo puts it back),
+  * copying files from this computer into Drive — and, only if you choose
+    Move, sending each original to the recycle bin AFTER its upload is
+    confirmed present at the right size. Nothing local is ever deleted
+    outright, and a copy never touches the originals, or
   * during `undo`, trashing a folder that the run itself created and that
     is now empty.
 Nothing is destroyed by this tool, and nothing writes without --execute.
@@ -144,7 +148,9 @@ def require_sdk() -> None:
     )
 
 
-def get_service(credentials_file: str, token_file: str):
+def get_credentials(credentials_file: str, token_file: str):
+    """The OAuth credentials, so a second API client can be built from
+    them — uploads need their own, or a large transfer blocks the UI."""
     require_sdk()
     creds = None
     if os.path.exists(token_file):
@@ -166,6 +172,11 @@ def get_service(credentials_file: str, token_file: str):
             creds = flow.run_local_server(port=0)
         with open(token_file, "w") as fh:
             fh.write(creds.to_json())
+    return creds
+
+
+def get_service(credentials_file: str, token_file: str):
+    creds = get_credentials(credentials_file, token_file)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -1652,6 +1663,153 @@ MAX_ZIP_ENTRIES = 2000
 MAX_SHARE_DETAIL = 1500                # per-item permission lookups
 SEARCH_LIMIT = 200                     # name-search results per query
 
+# ---------------------------------------------------------------------------
+# Local filesystem, for copying into Drive
+# ---------------------------------------------------------------------------
+
+UPLOAD_CHUNK = 8 * 1024 * 1024
+
+
+def _long(path: str) -> str:
+    """Windows refuses paths over 260 characters without this prefix."""
+    if os.name == "nt" and len(path) > 240 and not path.startswith("\\\\?\\"):
+        return "\\\\?\\" + os.path.abspath(path)
+    return path
+
+
+def is_hidden(path: str, name: str) -> bool:
+    if name.startswith("."):
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(_long(path))
+            # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+            return attrs != -1 and bool(attrs & 0x2)
+        except Exception:
+            return False
+    return False
+
+
+def recycle_available() -> bool:
+    """Whether a delete can go to the recycle bin rather than vanish."""
+    try:
+        import send2trash          # noqa: F401
+        return True
+    except ImportError:
+        return os.name == "nt"     # ctypes fallback below
+
+
+def send_to_recycle_bin(path: str) -> None:
+    """Delete a local file or folder RECOVERABLY.
+
+    This is the only place the tool touches local data, and it never
+    deletes outright: the item goes to the recycle bin, where the person
+    who asked for it can get it back. If neither route is available the
+    caller is told, and nothing is deleted.
+    """
+    try:
+        import send2trash
+        send2trash.send2trash(path)
+        return
+    except ImportError:
+        pass
+    if os.name != "nt":
+        raise RuntimeError(
+            "no recycle bin available — install send2trash to move files")
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND),
+                    ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_uint16),
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", wintypes.LPVOID),
+                    ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+    FO_DELETE, FOF_ALLOWUNDO = 3, 0x0040
+    FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT = 0x0010, 0x0400, 0x0004
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = os.path.abspath(path) + "\0\0"   # must be double-terminated
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI
+                 | FOF_SILENT)
+    res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if res != 0 or op.fAnyOperationsAborted:
+        raise RuntimeError(f"could not recycle (code {res})")
+
+
+def local_entries(path: str) -> List[Dict[str, Any]]:
+    """One directory listing, folders first, with sizes where cheap."""
+    out: List[Dict[str, Any]] = []
+    with os.scandir(_long(path)) as it:
+        for e in it:
+            try:
+                folder = e.is_dir(follow_symlinks=False)
+                st = e.stat(follow_symlinks=False)
+                out.append({
+                    "name": e.name,
+                    "path": os.path.join(path, e.name),
+                    "folder": folder,
+                    "size": 0 if folder else st.st_size,
+                    "modified": datetime.fromtimestamp(
+                        st.st_mtime).strftime("%Y-%m-%d"),
+                    "hidden": is_hidden(os.path.join(path, e.name), e.name),
+                    "artifact": (folder
+                                 and e.name.lower() in ARTIFACT_SEGMENTS),
+                    "link": e.is_symlink()})
+            except OSError:
+                continue          # unreadable entry; the walk reports it
+    out.sort(key=lambda r: (not r["folder"], r["name"].lower()))
+    return out
+
+
+def walk_local(root: str, skip_hidden: bool, skip_artifacts: bool
+               ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Everything under `root` that would be uploaded, plus what would not.
+
+    Skips are collected with a reason rather than dropped quietly — a
+    silent skip is how an upload appears to succeed while leaving things
+    behind.
+    """
+    files: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, str]] = []
+    base = os.path.dirname(os.path.abspath(root))
+    for dirpath, dirnames, filenames in os.walk(_long(root)):
+        real = dirpath[4:] if dirpath.startswith("\\\\?\\") else dirpath
+        keep = []
+        for d in dirnames:
+            full = os.path.join(real, d)
+            if skip_artifacts and d.lower() in ARTIFACT_SEGMENTS:
+                skipped.append({"path": full, "why": "build folder"})
+            elif skip_hidden and is_hidden(full, d):
+                skipped.append({"path": full, "why": "hidden"})
+            elif os.path.islink(full):
+                skipped.append({"path": full, "why": "shortcut or link"})
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+        for f in filenames:
+            full = os.path.join(real, f)
+            if skip_hidden and is_hidden(full, f):
+                skipped.append({"path": full, "why": "hidden"})
+                continue
+            try:
+                size = os.path.getsize(_long(full))
+            except OSError as err:
+                skipped.append({"path": full,
+                                "why": f"unreadable ({err.strerror or err})"})
+                continue
+            files.append({
+                "path": full,
+                "rel": os.path.relpath(full, base).replace("\\", "/"),
+                "size": size})
+    return files, skipped
+
+
 DOCX_MIME = ("application/vnd.openxmlformats-officedocument"
              ".wordprocessingml.document")
 DOC_MIME = "application/msword"
@@ -1718,7 +1876,19 @@ def docx_to_html(blob: bytes) -> Tuple[str, str]:
     """
     try:
         import mammoth           # optional, much better fidelity
-        result = mammoth.convert_to_html(io.BytesIO(blob))
+        # Its defaults drop a document's Title and Subtitle to plain
+        # paragraphs, which loses the top of the hierarchy on exactly the
+        # documents where it matters most.
+        # Matching is by style NAME, which mammoth reads from styles.xml.
+        # (There is no style-id selector; it is silently ignored.)
+        style_map = "\n".join([
+            "p[style-name='Title'] => h1:fresh",
+            "p[style-name='Subtitle'] => h2:fresh",
+            "p[style-name='Quote'] => blockquote:fresh",
+            "p[style-name='Intense Quote'] => blockquote:fresh",
+        ])
+        result = mammoth.convert_to_html(io.BytesIO(blob),
+                                         style_map=style_map)
         return result.value, "mammoth"
     except ImportError:
         pass
@@ -2135,6 +2305,21 @@ def run_undo(args) -> None:
                         fileId=fid,
                         body={"name": rec.get("from", "")}).execute)
                 ok += 1
+            elif rec.get("op") == "upload":
+                # Remove the copy that was created in Drive. The original
+                # on the computer is untouched by this.
+                if args.execute:
+                    with_backoff(service.files().update(
+                        fileId=fid, body={"trashed": True}).execute)
+                ok += 1
+            elif rec.get("op") == "local_recycle":
+                # Nothing to do in Drive, and restoring from the recycle
+                # bin is the operating system's job — say so rather than
+                # pretend it was handled.
+                skipped += 1
+                Progress.note(
+                    f"in your recycle bin, restore it there if you want "
+                    f"it back: {rec.get('path', '')}")
             elif rec.get("op") == "unshare":
                 # Restore a sharing permission removed in the Sharing tab.
                 if args.execute:
@@ -2843,6 +3028,8 @@ the same as deleting in Drive itself. Every change is logged and reversible.
         </button>
       <button id=tab-trash class=tab onclick="setView('trash')">Trash
         </button>
+      <button id=tab-local class=tab onclick="setView('local')">From this
+        PC</button>
     </div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
       <strong>My Drive</strong>
@@ -2873,6 +3060,15 @@ your whole Drive by name.">
     <div id=results class=tree style="display:none"></div>
     <div id=stree class=tree style="display:none"></div>
     <div id=ttree class=tree style="display:none"></div>
+    <div id=ltree class=tree style="display:none"></div>
+    <div id=lopts style="display:none;margin-top:12px;padding-top:10px;
+      border-top:1px solid var(--grid);display:none;gap:18px;
+      flex-wrap:wrap;font-size:12.5px;color:var(--ink2)">
+      <label><input type=checkbox id=skiphidden checked> skip hidden
+        files</label>
+      <label><input type=checkbox id=skipart checked> skip build folders
+        <span class=muted>(node_modules, .git, dist, venv…)</span></label>
+    </div>
   </div>
 
   <div class="panel sticky">
@@ -2887,15 +3083,37 @@ your whole Drive by name.">
       <button class="btn ghost" onclick=addCat()>Add</button>
     </div>
 
-    <div style="margin-top:18px;display:flex;align-items:center">
-      <strong style="flex:1">Planned moves</strong>
-      <span id=cnt class=muted style="font-size:13px">0</span>
+    <div id=movepanel>
+      <div style="margin-top:18px;display:flex;align-items:center">
+        <strong style="flex:1">Planned moves</strong>
+        <span id=cnt class=muted style="font-size:13px">0</span>
+      </div>
+      <div id=pend class=pend></div>
+      <button class=btn id=go onclick=execute() disabled
+        style="width:100%">Execute</button>
+      <div class=muted style="font-size:12px;margin-top:8px">A preview
+        appears first. Nothing runs until you confirm it there.</div>
     </div>
-    <div id=pend class=pend></div>
-    <button class=btn id=go onclick=execute() disabled
-      style="width:100%">Execute</button>
-    <div class=muted style="font-size:12px;margin-top:8px">A preview appears
-      first. Nothing runs until you confirm it there.</div>
+
+    <div id=uploadpanel style="display:none">
+      <div style="margin-top:18px;display:flex;align-items:center">
+        <strong style="flex:1">Planned uploads</strong>
+        <span id=ucnt class=muted style="font-size:13px">0</span>
+      </div>
+      <div id=upend class=pend></div>
+      <div style="display:flex;flex-direction:column;gap:5px;margin:6px 0 10px;
+        font-size:12.5px">
+        <label><input type=radio name=umode value=copy checked>
+          <strong>Copy</strong> — leave everything on this computer</label>
+        <label id=umovewrap><input type=radio name=umode value=move>
+          <strong>Move</strong> — send the originals to the recycle bin
+          once each upload is verified</label>
+      </div>
+      <button class=btn id=ugo onclick=uploadRun() disabled
+        style="width:100%">Upload</button>
+      <div class=muted style="font-size:12px;margin-top:8px">Nothing on this
+        computer is changed unless you choose Move.</div>
+    </div>
 
     <div style="margin-top:18px;display:flex;align-items:center">
       <strong style="flex:1">Revisions</strong>
@@ -3621,9 +3839,14 @@ function pickRows(){
   const raw = document.getElementById('pickq').value||'';
   const tokens = pickTokens(raw);
   const typed = raw.trim().replace(/^\/+|\/+$/g,'');
-  const own = PICK.path && isFolderPath(PICK.path) ? PICK.path : '';
-  const here = parentOf(PICK.path);      // where it already lives
-  const cur = (PLAN[PICK.id]||{}).target||'';
+  // A local file has no place in the Drive tree, so nothing is excluded
+  // and nowhere counts as "already here".
+  const own = (!PICK.local && PICK.path && isFolderPath(PICK.path))
+    ? PICK.path : '';
+  const here = PICK.local ? null : parentOf(PICK.path);
+  const cur = PICK.local
+    ? (UPLOAD[PICK.path]||{}).target||''
+    : (PLAN[PICK.id]||{}).target||'';
   const rows = [];
   rows.push({kind:'item', value:'', label:'leave where it is',
              checked:!cur});
@@ -3750,6 +3973,16 @@ function choosePick(isNew, idx){
   if(!r) return;
   const p = PICK, target = r.value;
   closePicker();
+  if(p.local){
+    // A local file being sent up: same picker, different plan.
+    if(isNew && target && !findCat(target)){
+      USER_CATS.push(target); saveCats(); rebuildCats(); drawCats();
+    }
+    pushRecent(target);
+    setUploadDest(p.path, p.name, p.folder, target,
+                  r.id || '');
+    return;
+  }
   if(isNew && target && !findCat(target)){
     USER_CATS.push(target); saveCats(); rebuildCats(); drawCats();
   } else if(target && !findCat(target)){
@@ -3992,6 +4225,261 @@ function drawClear(){
   const res = document.getElementById('results');
   b.style.display = (f.value || (res && res.style.display!=='none'))
     ? '' : 'none';
+}
+
+// ---- from this PC ---------------------------------------------------------
+// Browse the computer and choose Drive destinations for what should go up.
+// Uploading only ever adds to Drive; the originals are left alone unless
+// Move is chosen, and then they go to the recycle bin, never straight out.
+const UPLOAD = {};        // local path -> {path,name,folder,target,targetId}
+const LCACHE = {};        // local path -> entries
+let RECYCLE_OK = true;
+function lsep(p){ return p.indexOf('\\')>-1 ? '\\' : '/'; }
+function lbase(p){
+  const s = String(p||'').replace(/[\\\/]+$/,'');
+  const i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+  return i>-1 ? s.slice(i+1) : s;
+}
+async function lchildren(path){
+  if(LCACHE[path]) return LCACHE[path];
+  const d = await api('/api/local?path='+encodeURIComponent(path));
+  LCACHE[path] = d.items;
+  return d.items;
+}
+function lrowHtml(n){
+  const planned = UPLOAD[n.path];
+  const bits = [];
+  if(n.folder && n.artifact) bits.push('<span class="tag stay">build</span>');
+  if(n.hidden) bits.push('<span class="tag stay">hidden</span>');
+  if(n.link) bits.push('<span class="tag stay">link</span>');
+  return '<div class=tnode data-path="'+esc(n.path)+'" data-folder="'+
+    (n.folder?1:0)+'" data-name="'+esc(n.name)+'">'+
+    '<div class="trow'+(planned?' planned':'')+'">'+
+    '<span class=tw '+(n.folder?'onclick="ltog(this,\''+
+      esc(n.path).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')"':'')+'>'+
+      (n.folder?'&#9656;':'')+'</span>'+
+    '<span class=ic>'+icon({folder:n.folder, name:n.name, mime:''})+
+      '</span>'+
+    '<span class=nm title="'+esc(n.path)+'">'+esc(n.name)+'</span>'+
+    bits.join('')+
+    '<span class=mt>'+(n.size?human(n.size):'')+
+      (n.modified?' &middot; '+esc(n.modified):'')+'</span>'+
+    uploadBtn(n.path, n.name, n.folder, planned?planned.target:'')+
+    '</div><div class=kids style="display:none"></div></div>';
+}
+function uploadBtn(path, name, folder, cur){
+  const label = cur ? cur : 'leave on this PC';
+  return '<button class="destbtn'+(cur?' set':'')+'" title="'+esc(label)+
+    '" onclick="openUploadPicker(event,\''+
+    esc(path).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\',\''+
+    esc(name).replace(/'/g,"\\'")+'\','+(folder?1:0)+')">'+
+    esc(label)+' &#9662;</button>';
+}
+async function ltog(el, path){
+  const holder = el.closest('.tnode').querySelector(':scope > .kids');
+  if(holder.dataset.loaded){
+    const show = holder.style.display==='none';
+    holder.style.display = show?'':'none';
+    el.innerHTML = show?'&#9662;':'&#9656;';
+    return;
+  }
+  el.innerHTML='<span class=spin></span>';
+  try{
+    const items = await lchildren(path);
+    holder.innerHTML = items.length ? items.map(lrowHtml).join('')
+      : '<div class=muted style="padding:5px 6px;font-size:13px">empty</div>';
+    holder.dataset.loaded='1'; holder.style.display='';
+    el.innerHTML='&#9662;';
+  }catch(e){
+    el.innerHTML='&#9656;';
+    uiAlert(esc(niceErr(e)), {title:'Could not read that folder'});
+  }
+}
+async function bootLocal(){
+  const lt = document.getElementById('ltree');
+  lt.dataset.loaded='1';
+  lt.innerHTML='<div class=muted style="padding:6px"><span class=spin>'+
+    '</span> reading this computer&hellip;</div>';
+  let d;
+  try{ d = await api('/api/localroots'); }
+  catch(e){
+    lt.innerHTML='<div class=warn style="padding:6px">'+esc(niceErr(e))+
+      '</div>';
+    lt.dataset.loaded='';
+    return;
+  }
+  RECYCLE_OK = d.recycle !== false;
+  if(!RECYCLE_OK){
+    const w = document.getElementById('umovewrap');
+    if(w){
+      w.querySelector('input').disabled = true;
+      w.style.opacity = '.5';
+      w.title = 'Moving needs a recycle bin so the originals stay '+
+        'recoverable — install send2trash to enable it';
+    }
+  }
+  lt.innerHTML = d.roots.map(r=>lrowHtml(
+    {name:r.name, path:r.path, folder:true, size:0, modified:''})).join('');
+  drawUploads();
+}
+function openUploadPicker(ev, path, name, folder){
+  ev.stopPropagation();
+  PICK = {path:path, id:'local:'+path, name:name, active:0, local:true,
+          folder:!!folder};
+  const p = document.getElementById('picker');
+  const q = document.getElementById('pickq');
+  q.value = '';
+  REMOTE = {q:'', items:[]};
+  api('/api/folders').then(d=>{ FSTATUS = d; if(PICK) drawPicker(); })
+    .catch(e=>{});
+  drawPicker();
+  p.classList.add('on');
+  const r = ev.currentTarget.getBoundingClientRect();
+  const h = p.offsetHeight || 300;
+  let top = r.bottom + 6;
+  if(top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+  p.style.top = top+'px';
+  p.style.left = Math.max(8, Math.min(r.left,
+    window.innerWidth - p.offsetWidth - 10))+'px';
+  q.focus();
+}
+function setUploadDest(path, name, folder, target, targetId){
+  if(!target) delete UPLOAD[path];
+  else UPLOAD[path] = {path:path, name:name, folder:folder,
+                       target:target, targetId:targetId||''};
+  drawUploads();
+  redrawLocalButtons();
+}
+function redrawLocalButtons(){
+  document.querySelectorAll('#ltree .tnode').forEach(nd=>{
+    const b = nd.querySelector(':scope > .trow > .destbtn');
+    if(!b) return;
+    const cur = (UPLOAD[nd.dataset.path]||{}).target||'';
+    const label = cur ? cur : 'leave on this PC';
+    b.className = 'destbtn'+(cur?' set':'');
+    b.title = label;
+    b.innerHTML = esc(label)+' &#9662;';
+    const row = nd.querySelector(':scope > .trow');
+    if(row) row.classList.toggle('planned', !!cur);
+  });
+}
+function drawUploads(){
+  const keys = Object.keys(UPLOAD).sort();
+  const cnt = document.getElementById('ucnt');
+  const go = document.getElementById('ugo');
+  if(cnt) cnt.textContent = keys.length;
+  if(go){
+    go.disabled = !keys.length;
+    go.textContent = keys.length
+      ? 'Upload '+keys.length+' item'+(keys.length===1?'':'s') : 'Upload';
+  }
+  const box = document.getElementById('upend');
+  if(box) box.innerHTML = keys.length
+    ? keys.map(k=>'<div class=pi><span class=a title="'+esc(k)+'">'+
+        esc(lbase(k))+'</span><span class=tag>'+esc(UPLOAD[k].target)+
+        '</span><button class=x title="remove" onclick="unupload(\''+
+        esc(k).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+
+        '\')">&times;</button></div>').join('')
+    : '<div class=muted style="font-size:13px;padding:6px 0">Nothing '+
+      'selected. Choose a Drive folder next to anything you want '+
+      'uploaded.</div>';
+}
+function unupload(k){ delete UPLOAD[k]; drawUploads(); redrawLocalButtons(); }
+function uploadOpts(){
+  return {skip_hidden: document.getElementById('skiphidden').checked,
+          skip_artifacts: document.getElementById('skipart').checked};
+}
+async function uploadRun(){
+  const items = Object.values(UPLOAD);
+  if(!items.length) return;
+  const done = busy(document.getElementById('ugo'), 'Checking…');
+  let d;
+  try{
+    d = await api('/api/upload/preview',
+      Object.assign({plan:items}, uploadOpts()));
+  }catch(e){
+    uiAlert(esc(niceErr(e)), {title:'Could not read those folders'});
+    return;
+  }finally{ done(); }
+  const mode = (document.querySelector('input[name=umode]:checked')||{})
+    .value || 'copy';
+  const cl = d.clashes || [];
+  const box = document.getElementById('ovbox');
+  box.innerHTML = '<h2 style="margin-top:0">Confirm — upload '+
+    d.files.toLocaleString()+' file'+(d.files===1?'':'s')+'</h2>'+
+    (cl.length
+      ? '<div class=card style="border-color:var(--warn)"><strong>'+
+        cl.length+' name'+(cl.length===1?'':'s')+' already exist'+
+        (cl.length===1?'s':'')+' at the destination</strong>'+
+        '<div class=plog style="max-height:120px">'+
+        cl.map(c=>esc(c.target+'/'+c.name)).join('\n')+'</div>'+
+        '<div style="margin-top:10px;display:flex;flex-direction:column;'+
+        'gap:6px"><label><input type=radio name=uconf value=keep checked> '+
+        '<b>Keep both</b> — Drive allows the same name twice</label>'+
+        '<label><input type=radio name=uconf value=replace> '+
+        '<b>Replace</b> — the existing item goes to Drive trash</label>'+
+        '</div></div>'
+      : '')+
+    '<p class=muted>New folders: '+(d.creates.length?
+      d.creates.map(esc).join(', '):'none')+'</p>'+
+    '<div class=plog>'+(d.sample||[]).map(esc).join('\n')+
+      (d.files>(d.sample||[]).length?'\n… and '+
+        (d.files-(d.sample||[]).length).toLocaleString()+' more':'')+
+    '</div>'+
+    '<p class=muted>'+human(d.bytes)+' in total.'+
+      (d.skipped_total?' <span class=warn>'+d.skipped_total+
+        ' item(s) skipped</span> — hidden, build folders, links or '+
+        'unreadable.':'')+
+      (d.long_paths?' <span class=warn>'+d.long_paths+' path(s) are '+
+        'longer than Windows allows and will fail.</span>':'')+
+    '</p>'+
+    (d.skipped_total
+      ? '<div class=plog style="max-height:110px">'+
+        (d.skipped||[]).map(s=>esc(s.path)+'   — '+esc(s.why)).join('\n')+
+        '</div>' : '')+
+    '<p class=muted style="margin-top:12px">'+
+      (mode==='move'
+        ? '<strong>Move:</strong> each original goes to your recycle bin '+
+          'only after its upload is confirmed in Drive at the right size. '+
+          'Anything that does not match is left alone.'
+        : '<strong>Copy:</strong> nothing on this computer is changed.')+
+    '</p>'+
+    '<div style="display:flex;gap:9px;margin-top:6px">'+
+    '<button class="btn'+(mode==='move'?' danger':'')+'" id=urunbtn '+
+      'onclick="uploadGo(this,\''+mode+'\')">'+
+      (mode==='move'?'Upload and recycle the originals':'Upload')+
+      '</button>'+
+    '<button class="btn ghost" onclick=closeOv()>Cancel</button></div>';
+  document.getElementById('ov').classList.add('on');
+}
+async function uploadGo(btn, mode){
+  const conf = (document.querySelector('input[name=uconf]:checked')||{})
+    .value || 'keep';
+  LAST_ACTION = 'upload';
+  const done = busy(btn, 'Starting…');
+  const box = document.getElementById('ovbox');
+  try{
+    await api('/api/upload/execute', Object.assign(
+      {plan:Object.values(UPLOAD), mode:mode, on_conflict:conf},
+      uploadOpts()));
+  }catch(e){
+    done();
+    box.innerHTML='<h2 class=warn style="margin-top:0">Could not start</h2>'+
+      '<p>'+esc(niceErr(e))+'</p>'+
+      '<button class=btn onclick=closeOv()>Close</button>';
+    return;
+  }
+  box.innerHTML='<h2 style="margin-top:0">Uploading</h2>'+
+    '<div class=pbar><div class=pfill id=pf></div></div>'+
+    '<div id=pt class=muted>starting…</div><div class=plog id=pl></div>'+
+    '<div style="margin-top:10px"><button class="btn ghost" '+
+    'onclick=cancelRun(this)>Stop after this file</button></div>';
+  poll();
+}
+async function cancelRun(btn){
+  const done = busy(btn, 'Stopping…');
+  try{ await api('/api/cancel',{}); }catch(e){}
+  done();
 }
 
 // ---- drag and drop --------------------------------------------------------
@@ -4491,7 +4979,7 @@ const SCACHE = {};
 let TCACHE = [];
 function setView(v){
   VIEW = v;
-  ['org','share','trash'].forEach(t=>{
+  ['org','share','trash','local'].forEach(t=>{
     document.getElementById('tab-'+t).classList.toggle('on', v===t);
   });
   const res = document.getElementById('results');
@@ -4502,6 +4990,16 @@ function setView(v){
   else if(res && v==='org' && res.innerHTML) res.style.display = '';
   document.getElementById('stree').style.display = v==='share'?'':'none';
   document.getElementById('ttree').style.display = v==='trash'?'':'none';
+  document.getElementById('ltree').style.display = v==='local'?'':'none';
+  document.getElementById('lopts').style.display = v==='local'?'flex':'none';
+  // Two separate plans — Drive moves, and uploads from this PC — so only
+  // the one belonging to the current tab is shown.
+  document.getElementById('uploadpanel').style.display =
+    v==='local'?'':'none';
+  document.getElementById('movepanel').style.display =
+    v==='local'?'none':'';
+  if(v==='local' && !document.getElementById('ltree').dataset.loaded)
+    bootLocal();
   document.getElementById('onlyshared').style.display =
     v==='share'?'':'none';
   document.getElementById('sharehead').style.display =
@@ -5138,10 +5636,18 @@ async function poll(){
   const pf=document.getElementById('pf'), pt=document.getElementById('pt'),
         pl=document.getElementById('pl');
   if(pf){
-    const pct = s.total? Math.round(s.done/s.total*100):0;
+    // Uploads move bytes, so the bar follows those; everything else
+    // counts items.
+    const byBytes = s.bytes_total > 0;
+    const pct = byBytes
+      ? Math.round(s.bytes_done/s.bytes_total*100)
+      : (s.total? Math.round(s.done/s.total*100):0);
     pf.style.width = pct+'%';
-    pt.textContent = s.done+' of '+s.total+' — '+(s.total-s.done)+
-      ' left'+(s.current?' — '+s.current:'');
+    pt.textContent = s.done+' of '+s.total+
+      (byBytes? ' files · '+human(s.bytes_done)+' of '+
+        human(s.bytes_total) : ' — '+(s.total-s.done)+' left')+
+      (s.current?' — '+s.current:'')+
+      (s.pct? ' ('+s.pct+'%)':'');
     pl.textContent = s.log.join('\n'); pl.scrollTop = pl.scrollHeight;
   }
   if(!s.finished){ setTimeout(poll,500); return; }
@@ -5166,10 +5672,15 @@ async function poll(){
     ((s.undo_log && !undone)
       ? '<button class="btn ghost" onclick=undoRun()>Undo everything</button>'
       : '')+'</div>';
+  if(LAST_ACTION==='upload'){
+    Object.keys(UPLOAD).forEach(k=>delete UPLOAD[k]);
+    drawUploads(); redrawLocalButtons();
+  }
   // Destinations used by this run now exist in Drive, so they stop being
   // "something you typed that can be removed" and become ordinary folders.
   // Leaving an x on them afterwards offers an action with no meaning.
-  const used = Object.values(PLAN).map(p=>p.target).filter(Boolean);
+  const used = Object.values(PLAN).map(p=>p.target).filter(Boolean)
+    .concat(Object.values(UPLOAD).map(p=>p.target).filter(Boolean));
   used.forEach(t=>{
     const i = USER_CATS.indexOf(t);
     if(i!==-1) USER_CATS.splice(i,1);
@@ -5375,6 +5886,12 @@ class _Job:
         self.finished = True
         self.undo_log = ""
         self.verify = ""
+        # Uploads move real bytes, so progress is measured in them as well
+        # as in files, and a long transfer can be stopped.
+        self.bytes_done = 0
+        self.bytes_total = 0
+        self.pct = 0
+        self.cancel = False
 
 
 def run_ui(args) -> None:
@@ -5384,7 +5901,8 @@ def run_ui(args) -> None:
     import urllib.parse
     import webbrowser
 
-    service = get_service(args.credentials, args.token)
+    creds = get_credentials(args.credentials, args.token)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
     root_id = with_backoff(
         service.files().get(fileId="root", fields="id").execute)["id"]
 
@@ -6285,6 +6803,194 @@ def run_ui(args) -> None:
             # the run touched a handful of folders, not the whole Drive.
             schedule_reindex()
 
+    def upload_worker(plan: List[Dict[str, Any]], mode: str,
+                      skip_hidden: bool, skip_art: bool,
+                      on_conflict: str) -> None:
+        """Copy local files into Drive, and with mode="move", recycle the
+        originals once each upload is verified.
+
+        Runs on its own API client: a multi-gigabyte upload would otherwise
+        hold the shared lock and freeze browsing for the whole transfer.
+        """
+        from googleapiclient.http import MediaFileUpload
+        job.finished = False
+        job.done = job.total = 0
+        job.log, job.errors = [], []
+        job.verify = ""
+        job.bytes_done = job.bytes_total = 0
+        job.current = ""
+        job.pct = 0
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(LOG_DIR, exist_ok=True)
+        job.undo_log = os.path.abspath(
+            os.path.join(LOG_DIR, f"upload_{stamp}.jsonl"))
+        try:
+            up = build("drive", "v3", credentials=creds,
+                       cache_discovery=False)
+        except Exception as err:
+            job.errors.append(f"could not start: {err}")
+            job.finished = True
+            return
+        try:
+            with open(job.undo_log, "w", encoding="utf-8") as log:
+                def mkdir_remote(parent: str, name: str) -> str:
+                    made = with_backoff(up.files().create(
+                        body={"name": name, "mimeType": FOLDER_MIME,
+                              "parents": [parent]}, fields="id").execute)
+                    log.write(json.dumps({"op": "mkdir",
+                                          "file_id": made["id"],
+                                          "path": name}) + "\n")
+                    log.flush()
+                    return made["id"]
+
+                # Work out everything first, so the progress bar is honest
+                # about the total from the first file rather than growing.
+                units: List[Dict[str, Any]] = []
+                for it in plan:
+                    src = it.get("path") or ""
+                    tgt = it.get("target") or ""
+                    tid = it.get("targetId") or ""
+                    if not os.path.exists(src):
+                        job.errors.append(f"gone: {src}")
+                        continue
+                    if os.path.isdir(src):
+                        got, miss = walk_local(src, skip_hidden, skip_art)
+                        for m in miss:
+                            job.log.append(f"skipped  {m['path']}  — "
+                                           f"{m['why']}")
+                        units.extend({**f, "target": tgt, "targetId": tid,
+                                      "root": src} for f in got)
+                    else:
+                        units.append({
+                            "path": src, "rel": os.path.basename(src),
+                            "size": os.path.getsize(_long(src)),
+                            "target": tgt, "targetId": tid, "root": src})
+                job.total = len(units)
+                job.bytes_total = sum(u["size"] for u in units)
+
+                remote: Dict[Tuple[str, str], str] = {}
+
+                def ensure(base_id: str, rel_dir: str) -> str:
+                    """Folder id for a relative path under base, created
+                    as needed and cached so each folder is made once."""
+                    cur = base_id
+                    if not rel_dir:
+                        return cur
+                    for part in rel_dir.split("/"):
+                        key = (cur, part)
+                        if key in remote:
+                            cur = remote[key]
+                            continue
+                        hits = with_backoff(up.files().list(
+                            q=(f"name = '{part.replace(chr(92), chr(92)*2)}'"
+                               f" and mimeType = '{FOLDER_MIME}' and "
+                               f"'{cur}' in parents and trashed = false"),
+                            fields="files(id)", pageSize=1).execute
+                        ).get("files", [])
+                        cur = (hits[0]["id"] if hits
+                               else mkdir_remote(cur, part))
+                        remote[key] = cur
+                    return cur
+
+                uploaded_ok: List[Tuple[str, str]] = []
+                for unit in units:
+                    if job.cancel:
+                        job.log.append("cancelled — nothing further was "
+                                       "uploaded")
+                        break
+                    job.current = unit["rel"]
+                    job.pct = 0
+                    try:
+                        base = unit["targetId"] or folders.resolve(
+                            unit["target"])
+                        rel_dir = os.path.dirname(unit["rel"])
+                        parent = ensure(base, rel_dir.replace("\\", "/"))
+                        name = os.path.basename(unit["rel"])
+                        if on_conflict == "replace":
+                            ex = find_clash(unit["target"], name, "", parent)
+                            if ex:
+                                with_backoff(up.files().update(
+                                    fileId=ex["id"],
+                                    body={"trashed": True}).execute)
+                                log.write(json.dumps({
+                                    "op": "trash", "file_id": ex["id"],
+                                    "name": ex["name"],
+                                    "from": f"{unit['target']}/{name}",
+                                    "replaced_by": unit["path"]}) + "\n")
+                        media = MediaFileUpload(_long(unit["path"]),
+                                                chunksize=UPLOAD_CHUNK,
+                                                resumable=True)
+                        req = up.files().create(
+                            body={"name": name, "parents": [parent]},
+                            media_body=media, fields="id,size")
+                        resp = None
+                        while resp is None:
+                            if job.cancel:
+                                break
+                            status, resp = with_backoff(req.next_chunk)
+                            if status:
+                                job.pct = int(status.progress() * 100)
+                        if resp is None:
+                            job.log.append(f"cancelled during "
+                                           f"{unit['rel']}")
+                            break
+                        log.write(json.dumps({
+                            "op": "upload", "file_id": resp["id"],
+                            "name": name, "from": unit["path"],
+                            "to": f"{unit['target']}/{unit['rel']}",
+                            "size": unit["size"]}) + "\n")
+                        log.flush()
+                        uploaded_ok.append((resp["id"], unit["path"]))
+                        job.bytes_done += unit["size"]
+                        job.log.append(f"uploaded  {unit['rel']}")
+                    except Exception as err:
+                        msg = f"FAILED {unit['rel']}: {err}"
+                        job.errors.append(msg)
+                        job.log.append(msg)
+                    job.done += 1
+                    job.pct = 0
+
+                # Only now, and only for uploads confirmed present in
+                # Drive at the right size, is anything local touched.
+                if mode == "move" and uploaded_ok:
+                    job.current = "checking uploads before removing "\
+                                  "originals"
+                    recycled = 0
+                    for fid, src in uploaded_ok:
+                        try:
+                            meta = with_backoff(up.files().get(
+                                fileId=fid, fields="id,size,trashed"
+                            ).execute)
+                            local_size = os.path.getsize(_long(src))
+                            if meta.get("trashed") or (
+                                    int(meta.get("size") or -1)
+                                    != local_size):
+                                job.errors.append(
+                                    f"kept {src} — the copy in Drive does "
+                                    f"not match")
+                                continue
+                            send_to_recycle_bin(src)
+                            log.write(json.dumps({
+                                "op": "local_recycle", "path": src,
+                                "drive_id": fid,
+                                "at": datetime.now().isoformat(
+                                    timespec="seconds")}) + "\n")
+                            log.flush()
+                            recycled += 1
+                        except Exception as err:
+                            job.errors.append(f"kept {src}: {err}")
+                    job.log.append(f"moved to the recycle bin: {recycled} "
+                                   f"original(s)")
+            job.verify = (f"{len(uploaded_ok)} of {job.total} file(s) "
+                          f"uploaded and confirmed in Drive")
+        except Exception as err:
+            job.errors.append(f"{type(err).__name__}: {err}")
+        finally:
+            job.current = ""
+            job.cancel = False
+            job.finished = True
+            schedule_reindex()
+
     def undo_worker(path: str) -> None:
         if not path or not os.path.exists(path):
             job.finished = True
@@ -6317,6 +7023,14 @@ def run_ui(args) -> None:
                         body={"name": rec.get("from", "")}))
                     job.log.append(f"renamed back  {rec.get('to', '')}"
                                    f"  ->  {rec.get('from', '')}")
+                elif rec.get("op") == "upload":
+                    locked(service.files().update(
+                        fileId=rec["file_id"], body={"trashed": True}))
+                    job.log.append(f"removed upload  {rec.get('to', '')}")
+                elif rec.get("op") == "local_recycle":
+                    job.log.append(
+                        f"in your recycle bin — restore it from there: "
+                        f"{rec.get('path', '')}")
                 elif rec.get("op") == "mkdir":
                     # A folder this run created — remove it again, but only
                     # if it is empty now.
@@ -6489,6 +7203,57 @@ def run_ui(args) -> None:
                         "canTrash", True),
                     "scan_files": st.get("files"),
                     "scan_bytes": st.get("bytes")})
+                return
+
+            if u.path == "/api/localroots":
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                home = os.path.expanduser("~")
+                roots = []
+                for label, p in (("Desktop", os.path.join(home, "Desktop")),
+                                 ("Documents",
+                                  os.path.join(home, "Documents")),
+                                 ("Downloads",
+                                  os.path.join(home, "Downloads")),
+                                 ("Pictures", os.path.join(home, "Pictures")),
+                                 ("Home", home)):
+                    if os.path.isdir(p):
+                        roots.append({"name": label, "path": p,
+                                      "folder": True})
+                if os.name == "nt":
+                    import string
+                    for letter in string.ascii_uppercase:
+                        drive = f"{letter}:\\"
+                        if os.path.exists(drive):
+                            roots.append({"name": drive, "path": drive,
+                                          "folder": True})
+                else:
+                    roots.append({"name": "/", "path": "/", "folder": True})
+                self._send({"roots": roots,
+                            "recycle": recycle_available()})
+                return
+
+            if u.path == "/api/local":
+                if not self._authed():
+                    self._send({"error": "forbidden"}, 403)
+                    return
+                q = urllib.parse.parse_qs(u.query)
+                path = (q.get("path") or [""])[0]
+                if not path or not os.path.isdir(path):
+                    self._send({"error": "not a folder on this computer"},
+                               400)
+                    return
+                try:
+                    items = local_entries(path)
+                except PermissionError:
+                    self._send({"error": "this folder cannot be read — "
+                                         "permission denied"}, 403)
+                    return
+                except OSError as err:
+                    self._send({"error": str(err)}, 500)
+                    return
+                self._send({"items": items, "path": os.path.abspath(path)})
                 return
 
             if u.path == "/api/doc":
@@ -6769,7 +7534,8 @@ def run_ui(args) -> None:
                 q = urllib.parse.parse_qs(u.query)
                 name = (q.get("log") or [""])[0]
                 if not re.fullmatch(
-                        r"(ui|apply|quarantine)_\d{8}_\d{6}\.jsonl", name):
+                        r"(ui|apply|quarantine|upload)_\d{8}_\d{6}\.jsonl",
+                        name):
                     self._send({"error": "unknown log"}, 400)
                     return
                 cand = os.path.join(LOG_DIR, name)
@@ -6810,14 +7576,18 @@ def run_ui(args) -> None:
                 self._send({"total": job.total, "done": job.done,
                             "current": job.current, "log": job.log[-400:],
                             "errors": job.errors, "finished": job.finished,
-                            "undo_log": job.undo_log, "verify": job.verify})
+                            "undo_log": job.undo_log, "verify": job.verify,
+                            "bytes_done": job.bytes_done,
+                            "bytes_total": job.bytes_total,
+                            "pct": job.pct})
                 return
             if u.path == "/api/runs":
                 runs = []
                 base = LOG_DIR if os.path.isdir(LOG_DIR) else "."
                 for fn in os.listdir(base):
                     m = re.fullmatch(
-                        r"(ui|apply|quarantine)_(\d{8})_(\d{6})\.jsonl", fn)
+                        r"(ui|apply|quarantine|upload)_(\d{8})_(\d{6})"
+                        r"\.jsonl", fn)
                     if not m:
                         continue
                     moves = folders = 0
@@ -6988,6 +7758,84 @@ def run_ui(args) -> None:
                 self._send({"ok": True})
                 return
 
+            if u.path == "/api/upload/preview":
+                plan = body.get("plan") or []
+                skip_hidden = bool(body.get("skip_hidden", True))
+                skip_art = bool(body.get("skip_artifacts", True))
+                files: List[Dict[str, Any]] = []
+                skipped: List[Dict[str, str]] = []
+                clashes = []
+                creates = set()
+                for it in plan:
+                    src = it.get("path") or ""
+                    tgt = it.get("target") or ""
+                    tid = it.get("targetId") or ""
+                    if not os.path.exists(src):
+                        skipped.append({"path": src,
+                                        "why": "no longer on this computer"})
+                        continue
+                    if os.path.isdir(src):
+                        got, miss = walk_local(src, skip_hidden, skip_art)
+                        files.extend({**f, "target": tgt, "targetId": tid}
+                                     for f in got)
+                        skipped.extend(miss)
+                        creates.add(f"{tgt}/{os.path.basename(src)}")
+                    else:
+                        files.append({
+                            "path": src,
+                            "rel": os.path.basename(src),
+                            "size": os.path.getsize(_long(src)),
+                            "target": tgt, "targetId": tid})
+                        creates.add(tgt)
+                    try:
+                        ex = find_clash(tgt, os.path.basename(src), "", tid)
+                    except Exception:
+                        ex = None
+                    if ex:
+                        clashes.append({"path": src, "target": tgt,
+                                        "name": os.path.basename(src),
+                                        "existing": ex})
+                # Windows refuses these outright; better to say so now than
+                # to fail two thirds of the way through a long upload.
+                toolong = [f for f in files if len(f["path"]) > 255]
+                self._send({
+                    "files": len(files),
+                    "bytes": sum(f["size"] for f in files),
+                    "skipped": skipped[:200],
+                    "skipped_total": len(skipped),
+                    "clashes": clashes,
+                    "creates": sorted(creates),
+                    "long_paths": len(toolong),
+                    "recycle": recycle_available(),
+                    "sample": [f["rel"] for f in files[:200]]})
+                return
+
+            if u.path == "/api/upload/execute":
+                if not job.finished:
+                    self._send({"error": "a run is already in progress"}, 409)
+                    return
+                plan = body.get("plan") or []
+                if not plan:
+                    self._send({"error": "nothing to upload"}, 400)
+                    return
+                mode = body.get("mode")
+                if mode not in ("copy", "move"):
+                    mode = "copy"
+                if mode == "move" and not recycle_available():
+                    self._send({"error": "moving needs a recycle bin so the "
+                                         "originals stay recoverable; "
+                                         "install send2trash, or choose "
+                                         "copy"}, 400)
+                    return
+                threading.Thread(
+                    target=upload_worker,
+                    args=(plan, mode, bool(body.get("skip_hidden", True)),
+                          bool(body.get("skip_artifacts", True)),
+                          body.get("on_conflict") or "keep"),
+                    daemon=True).start()
+                self._send({"started": True})
+                return
+
             if u.path == "/api/rename":
                 fid = (body.get("id") or "").strip()
                 new = (body.get("name") or "").strip()
@@ -7106,6 +7954,13 @@ def run_ui(args) -> None:
                 self._send({"ok": True})
                 return
 
+            if u.path == "/api/cancel":
+                # Stops before the next file rather than mid-transfer, so
+                # nothing is left half-written in Drive.
+                job.cancel = True
+                self._send({"ok": True})
+                return
+
             if u.path == "/api/undo":
                 if not job.finished:
                     self._send({"error": "a run is in progress"}, 409)
@@ -7114,8 +7969,8 @@ def run_ui(args) -> None:
                 if name:
                     # Strict allowlist: a known log name, never a path.
                     if not re.fullmatch(
-                            r"(ui|apply|quarantine)_\d{8}_\d{6}\.jsonl",
-                            name):
+                            r"(ui|apply|quarantine|upload)_\d{8}_\d{6}"
+                            r"\.jsonl", name):
                         self._send({"error": "unknown undo log"}, 400)
                         return
                     cand = os.path.join(LOG_DIR, name)
